@@ -1,0 +1,61 @@
+Grammar::Syntactic::taka
+
++Syntax::TopLevel
+
+top_level ::= { top_level_elem | comment }
+top_level_elem ::= declare_something | fn_def
+
++Syntax::Functions
+
+fn_definition ::= fn_signature compaund_statement
+
+fn_signature ::= declaration identifier '(' type_and_name ')' [ '<' effect '>' ]
+
++Syntax::Statements
+
+labeled_statement ::= identifier ':' statement_list
+
+statement_list ::= { statement }
+
+statement ::= declaration_statement | for_statement | break_statement | return_statement | continue_statement | if_statement | while_statement | compaund_statement
+
+compaund_statement { statement_list }
+
+declaration_statement ::= assign_list ';' | type_or_variable ';' | function_signature ';'
+
+(* for statement *)
+
+for_statement ::= for_keyword '(' for_condition ')' compaund_statement
+
+for_condition ::= for_cond | for_each_cond
+
+for_cond ::= _init ';' _cond ';' _increment
+
+_init ::=
+_cond ::=
+_increment ::=
+
+for_each_cond ::=
+
+(* for statement end *)
+
+break_statement ::= break_keyword ';'
+
+return_statement ::= return_keyword expression ';'
+
+continue_statement ::= continue_keyword ';'
+
+if_statement ::= if_keyword '(' _cond ')' compaund_statement  { else_keyword ['(' _cond ')'] } compaund_statement
+while_statement ::= while_keyword
+
+compaund_statement ::= '{' statement_list '}'
+
+(* keywords *)
+
+break_keyword ::=
+return_keyword ::=
+continue_keyword ::=
+for_keyword ::=
+if_keyword ::=
+else_keyword ::=
+while_keyword ::=
