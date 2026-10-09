@@ -1,0 +1,9 @@
+fn main() {
+  i8 a = 8;
+  mut i8 x = 32;
+
+  a += 8;
+  x += 2;
+  i32* p = &a;
+  mut i32& r = x;
+}

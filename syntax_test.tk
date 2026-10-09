@@ -1,0 +1,418 @@
+// ============================================================
+// taka_lang — full syntax test (mirrors grammar.ebnf)
+// Everything here SHOULD parse. NEG: lines should NOT parse.
+// ============================================================
+
+// ---------- 0. comments ----------
+// line comment
+/* block comment */
+/* nestable /* inner */ outer */
+
+// ---------- 1. imports ----------
+import foo;
+import foo::bar::baz;
+
+// ---------- 2. visibility on items ----------
+pub import pub_stuff;
+private import priv_stuff;
+
+// ---------- 3. type aliases + globals ----------
+type MyInt = i32;
+pub type Pair = (i32, f32);
+private type Box<T> = List<T>;
+type FnAlias = fn(i32) <io> -> i32;
+
+i32 g_count = 0;
+pub mut i32 g_mut = 1;
+private sview g_name = "taka";
+auto g_auto = 42;
+// NEG: <> is illegal — <> bad;
+
+// ---------- 4. structs ----------
+struct Point { i32 x, i32 y, }
+pub struct PubPoint { pub i32 x, private i32 y, }
+private struct PrivPoint { i32 x, i32 y }
+struct GenericBox<T> { T value, }
+struct Bounded<T> where T: Clone { T v, }
+struct WithMisc {
+    pub const i32* name,
+    private mut u8 flags,
+    i32* ptr,
+    i32** pptr,
+}
+
+// ---------- 5. enums ----------
+enum Color { Red = 1, Green = 2, Blue = 4, }
+pub enum Shape {
+    pub Circle(f32),
+    private Rect { f32 w, f32 h, },
+    Empty,
+}
+private enum Verbose<T> where T: Clone {
+    Yes(T),
+    No,
+    Other = 7,
+}
+enum Mixed {
+    A(i32, f32),
+    B { i32 x, bool on },
+    C = 3,
+}
+
+// ---------- 6. effects ----------
+effect Log {
+    fn log(sview msg),
+    fn level() -> i32,
+}
+pub effect PubEff {
+    pub fn a(i32 x) -> i32,
+    private fn b(),
+}
+effect GenericEff<T> {
+    fn put(T v),
+    fn get() -> T,
+}
+
+// ---------- 7. handlers ----------
+handler ConsoleLog for Log {
+    log(sview msg) => { print(msg); resume(); },
+    level() => resume(2),
+}
+pub handler Full for Log {
+    log(sview m) => resume(),
+    level() => { resume(0); },
+    return (i32 x) => x,
+}
+
+// ---------- 8. functions: sigs ----------
+fn plain() {
+    return;
+}
+pub fn pub_fn(i32 x) -> i32 {
+    return x;
+}
+private fn priv_fn() <pure> {
+    return;
+}
+fn eff_io() <io> {
+    return;
+}
+fn eff_heap() <reads, writes, alloc> {
+    return;
+}
+fn eff_transact() <transacts> {
+    return;
+}
+fn eff_decides(i32 x) <decides> -> i32 {
+    return x;
+}
+fn eff_suspends() <suspends> {
+    return;
+}
+// NEG: suspends + decides must not mix on one sig
+// fn eff_bad() <suspends, decides> { return; }
+// NEG: pure never composes
+// fn eff_bad2() <pure, io> { return; }
+// NEG: transacts never mixes with reads/writes/alloc/pure
+// fn eff_bad3() <transacts, reads> { return; }
+fn eff_row_tail() <alloc | e> -> i32 {
+    return 0;
+}
+fn eff_bare_tail() <| e> {
+    return;
+}
+fn eff_custom() <Log> {
+    return;
+}
+fn eff_custom_generic() <Log, alloc | e> {
+    return;
+}
+fn generic_fn<T>(T x) -> T {
+    return x;
+}
+fn generic_bound<T: Clone>(T x) -> T {
+    return x;
+}
+fn generic_where<T>(T x) -> T where T: Clone {
+    return x;
+}
+fn multi_bound<T>(T x) where T: Clone + Copy {
+    return x;
+}
+fn trailing_comma(i32 a, f32 b,) -> i32 {
+    return a;
+}
+fn map_like<T, U>(List<T>* xs, fn(T) <| e> -> U f) <alloc | e> -> List<U> {
+    return xs;
+}
+// NOTE: generic struct lit like List<U> { } does NOT parse today
+// (struct_lit has no generic_args) — say if you want it:
+// NEG: auto g = List<U> { };
+// NOTE: tuple values like (1, 2) do NOT parse today
+// (only paren-expr + tuple types exist) — say if you want them:
+// NEG: auto t = (1, 2);
+
+// ---------- 9. types showcase ----------
+fn type_showcase(
+    i8 a, i16 b, i32 c, i64 d,
+    u8 e, u16 f, u32 g, u64 h,
+    f32 i, f64 j, char k, bool l, sview m,
+    const i32 n, mut i32 o, i32* p, i32** q,
+    const char* r, mut u8* s,
+    List<i32> t, Map<i32, sview> u,
+    (i32, f32) v, fn(i32) -> i32 w,
+    fn(i32) <io | e> -> i32 x, fn(T) <| e> -> U y,
+    [i32; 4] z
+) <pure> {
+    return;
+}
+fn paths_and_turbo() {
+    auto a = foo::bar::baz;
+    auto b = f::<i32>(1);
+    auto c = obj::method::<i32, f32>(2);
+    return;
+}
+
+// ---------- 10. literals ----------
+fn literals() {
+    i32 dec = 42;
+    i32 under = 1_000_000;
+    i32 hex = 0xFF_00;
+    i32 bin = 0b1010_0101;
+    f32 fl = 3.14;
+    f32 fl2 = 0.5;
+    sview s = "hello";
+    char c = 'x';
+    bool t = true;
+    bool ff = false;
+    auto paren = (1);
+    auto arr_init = { 1, 2, 3 };
+    return;
+}
+
+// ---------- 11. declarations ----------
+fn decls() {
+    i32 x = 1;
+    mut i32 y = 2, z = 3;
+    auto w = 4;
+    const i32 c = 5;
+    i32* p = 0;
+    auto pt = Point { x: 1, y: 2, };
+    auto emptylist = { };
+    return;
+}
+
+// ---------- 12. assignments (all ops) + lvalues ----------
+fn assigns() {
+    mut i32 x = 0;
+    x = 1;
+    x += 2;
+    x -= 3;
+    x *= 4;
+    x /= 5;
+    x %= 6;
+    x <<= 1;
+    x >>= 1;
+    x &= 255;
+    x |= 15;
+    x ^= 7;
+    xs[0] = 1;
+    obj.field = 2;
+    *p = 3;
+    *p += 4;
+    a.b.c = 5;
+    return;
+}
+
+// ---------- 13. calls / postfix / unary ----------
+fn calls_unary() {
+    f();
+    f(1, 2,);
+    obj.method(3);
+    xs[0] = f()[1].field;
+    i++;
+    i--;
+    ++i;
+    --i;
+    mut i32 a = +1;
+    mut i32 b = -2;
+    mut bool c = !flag;
+    mut i32 d = ~mask;
+    mut i32 e = *ptr;
+    mut i32* f2 = &val;
+    mut i32 g = sizeof x;
+    mut i32 h = offsetof y;
+    mut i32 k = sizeof(i32);
+    mut bool lt = a < b;
+    return;
+}
+
+// ---------- 14. binary ops by precedence + ternary ----------
+fn binops(i32 a, i32 b, i32 c) {
+    // 3: * / %
+    auto r1 = a * b / c % 2;
+    // 4: + -
+    auto r2 = a + b - c;
+    // 5: << >>
+    auto r3 = a << 2 >> 1;
+    // 6/7/8: & ^ |
+    auto r4 = (a & b) ^ c | 255;
+    // 9: comparisons (non-assoc: never chain a < b < c)
+    auto r5 = (a == b);
+    auto r6 = (a != b);
+    auto r7 = (a <= b);
+    auto r8 = (a >= b);
+    auto r9 = (a > b);
+    // 10/11: && ||
+    auto r10 = (a && b) || c;
+    // 12: ternary right-assoc
+    auto r11 = a ? 1 : b ? 2 : 3;
+    // mixed with parens
+    auto r12 = (a + b) * (c - 1) > 10 && flag || done;
+    return;
+}
+// NEG: chained comparison must be rejected by semantic check
+// fn bad_cmp() { auto x = a < b < c; }
+
+// ---------- 15. if / while ----------
+fn ifs(i32 x) {
+    if (x > 0) {
+        print(x);
+    }
+    if (x > 0) {
+        print(1);
+    } else {
+        print(0);
+    }
+    if (x == 1) {
+        print(1);
+    } else if (x == 2) {
+        print(2);
+    } else {
+        print(3);
+    }
+    // if-let / failable: hides <decides>
+    if (auto idx = find(&list, 7)) {
+        print(idx);
+    } else {
+        print("not found");
+    }
+    if (mut y = maybe()) {
+        print(y);
+    }
+    while (x < 10) {
+        x++;
+    }
+    while (auto v = next()) {
+        print(v);
+    }
+    return;
+}
+
+// ---------- 16. for ----------
+fn fors() {
+    for (mut u64 i = 0; i < 10; i++) {
+        print(i);
+    }
+    for (i = 0; i < 5; i += 1) {
+        print(i);
+    }
+    for (;;) {
+        break;
+    }
+    for (; cond;) {
+        continue;
+    }
+    for (v in list) {
+        print(v);
+    }
+    for (Shape::Circle(r) in shapes) {
+        print(r);
+    }
+    return;
+}
+
+// ---------- 17. control misc: labels, blocks, transact ----------
+fn control_misc() {
+    outer: for (auto x in xs) {
+        inner: while (flag) {
+            if (done) {
+                break;
+            }
+            continue;
+        }
+    }
+    {
+        auto scoped = 1;
+        print(scoped);
+    }
+    transact {
+        a.balance -= 1;
+        b.balance += 1;
+    }
+    auto v = { 1, 2, 3 };
+    auto w = {
+        auto t = 1;
+        t + 1
+    };
+    return;
+}
+
+// ---------- 18. match ----------
+fn matches(Shape s) -> i32 {
+    return match s {
+        Shape::Circle(r) => 1,
+        Shape::Rect { w, h } => 2,
+        Shape::Empty => 0,
+    };
+}
+fn match_guards(Shape s) -> i32 {
+    return match s {
+        Shape::Circle(r) if r > 10.0 => 2,
+        Shape::Circle(_) | Shape::Empty => 1,
+        Shape::Rect { w, .. } => 0,
+        _ => 99,
+        42 => 100,
+        mut x => 101,
+    };
+}
+
+// ---------- 19. effects: perform / handle / spawn ----------
+effect Ask {
+    fn ask() -> i32,
+}
+handler Answer for Ask {
+    ask() => resume(42),
+}
+fn uses_effects() <Ask, alloc> -> i32 {
+    perform Ask::ask();
+    auto v = perform Ask::ask();
+    if (perform Log::level() > 1) {
+        perform Log::log("verbose");
+    }
+    return v;
+}
+fn handles() <io> {
+    i32 r = handle work(21) with ConsoleLog;
+    i32 q = handle work(1) with {
+        log(sview m) => resume(),
+        level() => resume(0),
+    };
+    // spawn hides <suspends>: spawner needs no <suspends>
+    spawn background_job();
+    spawn {
+        do_work();
+    }
+    return;
+}
+fn ticker() <suspends, io> {
+    spawn background_job();
+    sleep(1);
+    return;
+}
+fn transfer(Account* a, Account* b, i64 n) <transacts> {
+    transact {
+        a.balance -= n;
+        b.balance += n;
+    }
+}

@@ -1,61 +1,381 @@
-Grammar::Syntactic::taka
+(* ============================================================ *)
+(* taka grammar, revision 4                                     *)
+(* Simple C-like core, Rust-style enums, Verse-style effects,   *)
+(* traits (static + dyn), C++-style lambdas, defer              *)
+(* ============================================================ *)
 
-+Syntax::TopLevel
+(* ---------- design rules (what taka deliberately does NOT have) ----------
+   - no overloading, no implicit conversions (use 'as'), no operator overloading
+   - no inheritance, no exceptions (effects + 'decides' instead)
+   - no textual macros, no headers (modules/import), no default lambda captures
+   - no hidden allocation: anything that allocates says <alloc>
+   - no undefined evaluation order for declared things: left-to-right everywhere
+   - one way to do each thing: one declaration syntax, one cast syntax, one loop form each
+   Everything compiles to plain C: structs, functions, vtables, closure structs.
+*)
 
-top_level ::= { top_level_elem | comment }
-top_level_elem ::= declare_something | fn_def
+(* ---------- lexical ----------
+   Whitespace and comments are skipped by the lexer.
 
-+Syntax::Functions
+   line_comment   ::= "//" { any - '\n' }
+   block_comment  ::= "/*" { any } "*/"                       (nestable)
+   identifier     ::= ( letter | '_' ) { letter | digit | '_' }  minus keywords
+                      The single character '_' alone is the token WILDCARD.
+   int_literal    ::= ( digit { digit | '_' }
+                      | "0x" hexdigit { hexdigit | '_' }
+                      | "0b" bit { bit | '_' } ) [ int_suffix ]
+   int_suffix     ::= "i8"|"i16"|"i32"|"i64"|"u8"|"u16"|"u32"|"u64"
+   float_literal  ::= digit { digit } '.' digit { digit } [ exponent ] [ "f32" | "f64" ]
+   string_literal ::= '"' { char | escape } '"'
+   char_literal   ::= '\'' ( char | escape ) '\''
 
-fn_definition ::= fn_signature compaund_statement
+   keywords:
+     fn struct enum effect handler trait impl dyn type extern import mod pub private
+     const mut auto where for in if else while match break continue return defer
+     perform handle with resume transact spawn as sizeof offsetof
+     true false null undef Self
 
-fn_signature ::= declaration identifier '(' type_and_name ')' [ '<' effect '>' ]
+   primitive type names:
+     i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char bool sview never
+   (sview, not s-view, which would lex as s - view)
 
-+Syntax::Statements
+   effect names (contextual: special only inside < > of an effect_row):
+     io alloc reads writes decides suspends transacts pure ownership
 
-labeled_statement ::= identifier ':' statement_list
+   Token splitting (parser may split a lexer token):
+     - '>>' / '>>=' is split when closing generic args / effect rows.
+     - '&&' in prefix position is two '&'.
+     - '<' in an expression is ALWAYS comparison. Generic args in expressions
+       use turbofish:  f::<i32>(x)
+*)
 
-statement_list ::= { statement }
+(* ---------- items ---------- *)
+program        ::= { item } ;
+item           ::= [ visibility ] ( import_decl | fn_def | fn_proto | extern_decl
+                                  | struct_def | enum_def | effect_def | handler_def
+                                  | trait_def | impl_def | type_alias | global_decl ) ;
+visibility     ::= 'pub' | 'private' ;               (* default: private *)
+import_decl    ::= 'import' path ';' ;
+type_alias     ::= 'type' identifier [ generics ] '=' type ';' ;
+global_decl    ::= declaration ;
 
-statement ::= declaration_statement | for_statement | break_statement | return_statement | continue_statement | if_statement | while_statement | compaund_statement
+fn_def         ::= fn_sig block ;
+fn_proto       ::= fn_sig ';' ;
+extern_decl    ::= 'extern' [ string_literal ] fn_sig ';' ;   (* extern "C" fn ... *)
+fn_sig         ::= 'fn' identifier [ generics ] '(' [ params ] ')'
+                   [ effect_row ] [ '->' type ] [ where_clause ] ;
+params         ::= param { ',' param } [ ',' ] ;
+param          ::= [ 'mut' ] type identifier ;
 
-compaund_statement { statement_list }
+struct_def     ::= 'struct' identifier [ generics ] [ where_clause ] '{' [ fields ] '}' ;
+fields         ::= field { ',' field } [ ',' ] ;
+field          ::= [ visibility ] type identifier ;
 
-declaration_statement ::= assign_list ';' | type_or_variable ';' | function_signature ';'
+(* One variant rule. Semantic: an enum is EITHER data-carrying OR C-like
+   (unit variants with optional '= const_expr'); mixing is an error.
+   Variants inherit the enum's visibility. *)
+enum_def       ::= 'enum' identifier [ generics ] [ where_clause ] '{' [ variants ] '}' ;
+variants       ::= variant { ',' variant } [ ',' ] ;
+variant        ::= identifier [ '(' type_list ')'
+                              | '{' variant_fields '}'
+                              | '=' const_expr ] ;
+variant_fields ::= variant_field { ',' variant_field } [ ',' ] ;
+variant_field  ::= type identifier ;
 
-(* for statement *)
+generics       ::= '<' generic_param { ',' generic_param } [ ',' ] '>' ;
+generic_param  ::= identifier [ ':' bound ]
+                 | 'effect' identifier ;                (* effect-row variable *)
+where_clause   ::= 'where' identifier ':' bound { ',' identifier ':' bound } ;
+bound          ::= path [ generic_args ] { '+' path [ generic_args ] } ;   (* trait bounds *)
 
-for_statement ::= for_keyword '(' for_condition ')' compaund_statement
+(* ---------- traits (minimal: methods only) ----------
+   No associated types, no default methods, no overlapping or blanket impls (v1).
+   'Self' is the implementing type. Method effect rows in an impl must be a subset
+   of the rows in the trait declaration. *)
+trait_def      ::= 'trait' identifier [ generics ] [ ':' bound ] '{' { fn_proto } '}' ;
+impl_def       ::= 'impl' [ generics ] path [ generic_args ] 'for' type
+                   [ where_clause ] '{' { fn_def } '}' ;
 
-for_condition ::= for_cond | for_each_cond
+(* ---------- effects ---------- *)
+(* Row polymorphism is declared in generics:
+     fn map<T, U, effect E>(List<T>* xs, fn(T) <E> -> U f) <alloc, E> -> List<U> *)
+effect_row     ::= '<' effect_item { ',' effect_item } [ ',' ] '>' ;
+effect_item    ::= builtin_effect | path [ generic_args ] ;
+builtin_effect ::= 'io' | 'alloc' | 'reads' | 'writes' | 'decides'
+                 | 'suspends' | 'transacts' | 'pure' | 'ownership' ;
+(* semantic: '<>' is a syntax error; 'pure' only alone.
+   semantic: 'transacts' implies reads+writes+alloc and never mixes with them.
+   semantic: suspends + decides never on one signature. *)
 
-for_cond ::= _init ';' _cond ';' _increment
+effect_def     ::= 'effect' identifier [ generics ] '{' [ effect_ops ] '}' ;
+effect_ops     ::= effect_op { ',' effect_op } [ ',' ] ;
+effect_op      ::= 'fn' identifier '(' [ params ] ')' [ '->' type ] ;
 
-_init ::=
-_cond ::=
-_increment ::=
+handler_def    ::= 'handler' identifier [ generics ] 'for' path [ effect_row ]
+                   '{' [ handler_ops ] '}' ;
+handler_body   ::= '{' [ handler_ops ] '}' ;      (* inline handlers use the enclosing row *)
+handler_ops    ::= handler_op { ',' handler_op } [ ',' ] ;
+handler_op     ::= identifier '(' [ params ] ')' '=>' ( expr | block )
+                 | 'return' '(' param ')' '=>' ( expr | block ) ;
 
-for_each_cond ::=
+(* ---------- types ---------- *)
+(* 'mut' belongs to a binding, not a type. 'const' qualifies the pointee.
+   fn(T) -> U         fat closure value {code, env}; works for functions and lambdas
+   extern fn(T) -> U  thin C function pointer, for C interop only
+   dyn Trait*         fat pointer {data, vtable}; 'dyn Trait' alone is unsized (error) *)
+(* References: 'T&' is a non-null, non-reseatable, auto-dereferenced alias to a place.
+   It is the LAST modifier: 'T&', 'T*&' (reference to pointer) are legal;
+   'T&*' (pointer to reference) and 'T&&' are not. 'const T&' is read-only.
+   References compile to C pointers. 'dyn Trait&' is a fat reference. *)
+type           ::= [ 'const' ] type_body { '*' } [ '&' ] ;
+auto_type      ::= [ 'const' ] 'auto' [ '&' ] ;       (* auto = copy, auto& = reference *)
+type_body      ::= primitive
+                 | path [ generic_args ]
+                 | [ 'extern' ] 'fn' '(' [ type_list ] ')' [ effect_row ] [ '->' type ]
+                 | 'dyn' path [ generic_args ]
+                 | '(' type_list ')'                          (* tuple *)
+                 | '[' type ';' const_expr ']' ;              (* fixed array *)
+type_list      ::= type { ',' type } [ ',' ] ;
+generic_args   ::= '<' type_list '>' ;
+path           ::= ( identifier | 'Self' ) { '::' identifier } ;
+primitive      ::= 'i8' | 'i16' | 'i32' | 'i64' | 'u8' | 'u16' | 'u32' | 'u64'
+                 | 'f32' | 'f64' | 'char' | 'bool' | 'sview' | 'never' ;
 
-(* for statement end *)
+(* ---------- statements ---------- *)
+(* A block's value is a trailing expression without ';'. A block-like statement
+   in LAST position with no ';' is that value. *)
+block          ::= '{' { statement } [ expr ] '}' ;
 
-break_statement ::= break_keyword ';'
+statement      ::= declaration
+                 | simple_stmt ';'
+                 | block_like
+                 | if_stmt | while_stmt | for_stmt
+                 | defer_stmt
+                 | 'break' [ identifier ] ';'
+                 | 'continue' [ identifier ] ';'
+                 | 'return' [ expr ] ';'
+                 | identifier ':' statement ;                 (* label *)
 
-return_statement ::= return_keyword expression ';'
+(* defer runs at scope exit, in reverse order, on every exit path (return, break,
+   failure rollback). The C-friendly answer to RAII. *)
+defer_stmt     ::= 'defer' ( simple_stmt ';' | block ) ;
 
-continue_statement ::= continue_keyword ';'
+block_like     ::= block | match_expr | handle_block | transact_expr ;
+handle_block   ::= 'handle' ( block | expr ) 'with' handler_body ;
 
-if_statement ::= if_keyword '(' _cond ')' compaund_statement  { else_keyword ['(' _cond ')'] } compaund_statement
-while_statement ::= while_keyword
+(* Parser rule: try "[mut] type identifier" first; if that fails, fall back to
+   simple_stmt. `a * b;` therefore parses as a declaration of pointer b. *)
+declaration    ::= variable_declaration ';' ;
+variable_declaration ::= [ 'mut' ] ( type | auto_type ) identifier '=' expr ;
+(* One variable per declaration, initializer always required (no uninitialized
+   variables, no comma lists, no '{...}' initializer). Aggregates use struct_lit,
+   array_lit, or the empty forms `T {}` / `[x; N]` for zero/fill init. *)
 
-compaund_statement ::= '{' statement_list '}'
+(* A later pass rejects statements with no effect: the top node must be a call,
+   perform, handle, resume, spawn, transact, ++/--, or an assignment. *)
+simple_stmt    ::= expr [ assign_op expr ] ;
+assign_op      ::= '=' | '+=' | '-=' | '*=' | '/=' | '%='
+                 | '<<=' | '>>=' | '&=' | '|=' | '^=' ;
 
-(* keywords *)
+if_stmt        ::= 'if' '(' condition ')' block
+                   { 'else' 'if' '(' condition ')' block } [ 'else' block ] ;
+while_stmt     ::= 'while' '(' condition ')' block ;
+for_stmt       ::= 'for' '(' ( for_c | for_each ) ')' block ;
+for_c          ::= [ variable_declaration | simple_stmt ] ';' [ expr ] ';' [ simple_stmt ] ;
+for_each       ::= pattern 'in' expr ;
 
-break_keyword ::=
-return_keyword ::=
-continue_keyword ::=
-for_keyword ::=
-if_keyword ::=
-else_keyword ::=
-while_keyword ::=
+(* 'auto' is required in the failable form so `if (x = 5)` is never a binding.
+   semantic: a 'decides' call or transact_expr in a condition is a failure context.
+   Any other expression must be bool. *)
+condition      ::= expr | 'auto' pattern '=' expr ;
+
+(* ---------- expressions ---------- *)
+expr           ::= ternary ;
+ternary        ::= binary [ '?' expr ':' ternary ] ;          (* right-assoc *)
+binary         ::= cast { binop cast } ;                      (* Pratt, table below *)
+binop          ::= '*' | '/' | '%' | '+' | '-' | '<<' | '>>'
+                 | '&' | '^' | '|'
+                 | '==' | '!=' | '<' | '>' | '<=' | '>='
+                 | '&&' | '||' ;
+cast           ::= unary { 'as' type } ;
+unary          ::= ( '+' | '-' | '!' | '~' | '*' | '&' | '++' | '--' ) unary
+                 | postfix ;
+postfix        ::= primary { '(' [ expr_list ] ')'             (* call *)
+                           | '[' expr ']'                       (* index *)
+                           | '.' identifier                     (* field or method, auto-deref *)
+                           | '++' | '--' } ;
+primary        ::= literal
+                 | path [ turbofish ]
+                 | '(' expr ')'
+                 | struct_lit
+                 | array_lit
+                 | lambda_expr
+                 | sizeof_expr
+                 | offsetof_expr
+                 | if_expr
+                 | match_expr
+                 | perform_expr
+                 | handle_expr
+                 | spawn_expr
+                 | resume_expr
+                 | transact_expr ;
+(* No bare block_expr and no '{...}' initializer: '{' in expression position is a struct_lit. *)
+
+turbofish      ::= '::' '<' type_list '>' ;
+struct_lit     ::= path '{' [ field_init { ',' field_init } [ ',' ] ] '}' ;
+field_init     ::= identifier ':' expr ;
+array_lit      ::= '[' [ expr_list ] ']'
+                 | '[' expr ';' const_expr ']' ;                (* fill: [0; 256] *)
+expr_list      ::= expr { ',' expr } [ ',' ] ;
+sizeof_expr    ::= 'sizeof' '(' ( type | expr ) ')' ;
+offsetof_expr  ::= 'offsetof' '(' type ',' identifier ')' ;
+
+(* ---------- lambdas (C++-style capture list) ----------
+   '[' ... ']' followed by '(' is a lambda; an array literal can never be called,
+   so there is no conflict. No default captures ([=] / [&] do not exist).
+   Effect row: if omitted the row is inferred from the body, and checked against the
+   expected fn type when passed to a parameter. Return type is inferred if omitted. *)
+lambda_expr    ::= '[' [ capture_list ] ']' '(' [ lambda_params ] ')'
+                   [ effect_row ] [ '->' type ] lambda_body ;
+lambda_body    ::= block | '=>' expr ;
+capture_list   ::= capture { ',' capture } [ ',' ] ;
+capture        ::= '&' identifier                              (* by reference *)
+                 | [ 'mut' ] identifier [ '=' expr ] ;         (* copy, or init capture *)
+lambda_params  ::= lambda_param { ',' lambda_param } [ ',' ] ;
+lambda_param   ::= [ 'mut' ] ( type | auto_type ) identifier ;
+
+if_expr        ::= 'if' '(' condition ')' block
+                   { 'else' 'if' '(' condition ')' block } 'else' block ;
+
+perform_expr   ::= 'perform' path '(' [ expr_list ] ')' ;
+handle_expr    ::= 'handle' ( block | expr ) 'with' ( path | handler_body ) ;
+spawn_expr     ::= 'spawn' ( postfix | block ) ;              (* postfix must be a call *)
+resume_expr    ::= 'resume' '(' [ expr ] ')' ;                (* only inside handler_op *)
+transact_expr  ::= 'transact' block ;
+
+(* ---------- patterns ---------- *)
+match_expr     ::= 'match' '(' expr ')' '{' arm { ',' arm } [ ',' ] '}' ;
+arm            ::= pattern [ 'if' expr ] '=>' ( expr | block ) ;
+pattern        ::= pattern_primary { '|' pattern_primary } ;
+pattern_primary::= WILDCARD
+                 | '&' identifier                (* binds a reference into the matched place *)
+                 | literal
+                 | [ 'mut' ] identifier         (* binding; or unit variant if the name resolves to one *)
+                 | path [ '(' [ pattern_list ] ')'
+                        | '{' [ field_pats ] '}' ] ;
+pattern_list   ::= pattern { ',' pattern } [ ',' ] ;
+field_pats     ::= field_pat { ',' field_pat } [ ',' '..' ] [ ',' ]
+                 | '..' [ ',' ] ;
+field_pat      ::= identifier [ ':' pattern ] ;
+
+literal        ::= int_literal | float_literal | string_literal | char_literal
+                 | 'true' | 'false' | 'null' | 'undef' ;
+const_expr     ::= expr ;                                     (* semantically constant *)
+
+(* ---------- precedence, highest to lowest ----------
+    1  postfix  () [] . ++ --                           left
+    2  prefix   + - ! ~ * & ++ --                       right
+    3  as                                               left
+    4  * / %                                            left
+    5  + -                                              left
+    6  << >>                                            left
+    7  &                                                left
+    8  ^                                                left
+    9  |                                                left
+   10  == != < > <= >=                                  non-assoc (reject a < b < c)
+   11  &&                                               left
+   12  ||                                               left
+   13  ?:                                               right
+   Assignment is a statement, not an expression.
+*)
+
+(* ---------- semantic rules ----------
+  Effects
+   1. Superset composition: a caller declares at least the effects of what it calls.
+      transacts covers reads/writes/alloc. Joining branches unions effects.
+   2. Unannotated functions are pure. Lambdas are the exception: row inferred.
+   3. Failure contexts (if/while condition, transact_expr) hide 'decides'.
+      spawn hides suspends. handle hides the effects its handler handles.
+      transact requires <transacts>; on failure all effects roll back and the
+      transact_expr is false.
+   4. suspends and decides never mix on one signature.
+   5. resume is one-shot.
+   6. 'effect E' variables are only usable in effect rows; an fn type with no row is pure.
+
+  Traits and dispatch
+   7. Static dispatch: 'where T: Trait' is monomorphized, no runtime cost.
+   8. Dynamic dispatch: only through 'dyn Trait*'. Creating one is an explicit cast:
+          dyn Shape* s = &circle as dyn Shape*;
+      Method calls on dyn go through the vtable. There are no implicit conversions.
+   9. A trait is dyn-compatible only if no method takes or returns Self by value
+      and no method has its own generics.
+  10. An impl method's effect row must be a subset of the trait method's row.
+  11. 'x.f(args)' resolves: field of function type first, else method by impl
+      lookup on the (auto-dereffed) type. Ambiguity is an error, never a silent pick.
+
+  Lambdas
+  12. fn(T) -> U is a fat pair {code, env}. env is null for non-capturing lambdas and
+      for plain function names (auto-converted, the one allowed implicit conversion).
+  13. Capturing lambdas are stack-allocated and non-escaping: they may be passed down
+      and called, but not returned or stored in longer-lived locations (checked
+      conservatively). Escaping closures are future work, as an explicit <alloc> form.
+  14. '[&x]' captures a reference (x is used as plain `x` inside the body).
+      Its validity is the programmer's responsibility, same as a pointer.
+
+  References
+  14a. A reference must be bound at its declaration (initializers are always
+       required, so this is free). It can never be null or reseated: `r = v` writes
+       through to the referent.
+  14b. Binding is implicit from an lvalue: `i32& r = x;` and `f(x)` for a `T&`
+       parameter. This is the ONE implicit address-taking in the language; mutation
+       through a `T&` parameter is therefore invisible at the call site, which is
+       why read-only `const T&` is the preferred parameter form.
+  14c. '&e' on any lvalue (including a reference) yields a pointer to the referent.
+       '*p' yields an lvalue that can bind to a `T&`. `dyn Trait&` comes from an
+       explicit cast: `dyn Shape& s = c as dyn Shape&;`
+  14d. `mut` on a reference binding is an error (nothing can be reseated). The
+       referent's mutability is expressed by `const` on the type.
+  14e. A reference may not outlive its referent: returning a reference to a local,
+       or storing one in a longer-lived location, is a (conservatively checked) error.
+       Reference-typed struct fields are allowed and must be set in every struct_lit.
+  14f. '&&' in a type is an error (no rvalue references, no move semantics).
+       Pattern '&x' binds by reference: `match (s) { Shape::Circle(&r) => r *= 2.0 }`
+       and `for (&x in xs) { x += 1; }`. Plain bindings copy.
+  14g. Prefer `Self&` / `const Self&` as the receiver in traits; `Self*` still works.
+
+  Misc
+  0. 'undef' is only valid as the whole initializer of a variable_declaration
+     (`[u8; 4096] buf = undef;`). Reading before writing is a compile error where
+     detectable. Initializers are otherwise always required.
+  15. '.' auto-dereferences one pointer level. There is no '->'.
+  16. defer runs in reverse order at scope exit on every exit path.
+  17. A statement whose top node has no effect is an error.
+  18. Enum variants: payload variants and '= const_expr' never coexist in one enum.
+  19. Reserved, syntax not yet defined: mod bodies, slices, race/sync,
+      associated types, default trait methods, escaping closures.
+*)
+
+(* ---------- example ----------
+   trait Shape {
+       fn area(Self* self) <reads> -> f32;
+   }
+   struct Circle { f32 r }
+   impl Shape for Circle {
+       fn area(Circle* self) <reads> -> f32 { return 3.14159 * self.r * self.r; }
+   }
+
+   fn total<T>(T* xs, u64 n) <reads> -> f32 where T: Shape { ... }      // static
+   fn total_dyn(dyn Shape** xs, u64 n) <reads> -> f32 { ... }           // dynamic
+
+   fn main() <io, alloc> {
+       FILE* f = open("a.txt");
+       defer close(f);
+
+       i32 k = 10;
+       auto add_k = [k](i32 x) => x + k;
+       auto ys = map(&list, [k](auto x) => x + k);
+
+       mut i32 count = 0;
+       each(&list, [&count](i32 x) <writes> { count += x; });
+   }
+*)
