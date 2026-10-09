@@ -1,0 +1,24 @@
+{
+  "name": "taka",
+  "displayName": "taka_lang",
+  "description": "Syntax highlighting for the taka language (*.tk)",
+  "version": "0.1.0",
+  "engines": { "vscode": "^1.60.0" },
+  "contributes": {
+    "languages": [
+      {
+        "id": "taka",
+        "aliases": ["taka", "taka_lang"],
+        "extensions": [".tk"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "taka",
+        "scopeName": "source.taka",
+        "path": "./taka.tmLanguage.json"
+      }
+    ]
+  }
+}

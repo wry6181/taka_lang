@@ -1,0 +1,13 @@
+id = "taka"
+name = "taka language support"
+version = "0.1.0"
+schema_version = 1
+authors = ["taka contributors"]
+description = "taka language support (Tree-sitter highlighting, outline, brackets)"
+repository = "https://github.com/<you>/tree-sitter-taka"
+
+# Local dev: point this at an absolute file:// path (see README.md).
+# Published: push editors/tree-sitter-taka to GitHub and use its https URL + rev.
+[grammars.taka]
+repository = "file:///home/sb/github/my_language/editors/tree-sitter-taka"
+rev = "4bb7692e0532edb771de28a379766170dea2ed22"

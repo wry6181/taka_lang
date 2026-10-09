@@ -1,0 +1,35 @@
+extern fn tk_print_i32(i32 x);
+
+struct Point { i32 x, i32 y, }
+
+enum Color { Red = 1, Green = 2, Blue = 4, }
+
+fn add(i32 a, i32 b) -> i32 {
+    return a + b;
+}
+
+fn ass() {
+  
+}
+
+fn is_red(Color c) -> bool {
+    return c == Color::Red;
+}
+
+fn main() {
+    Point p = Point { x: 10, y: 20, };
+    i32 s = add(p.x, p.y);
+    tk_print_i32(s);
+    mut i32 total = 0;
+    for (mut i32 i = 0; i < 5; i++) {
+        total += i;
+    }
+    tk_print_i32(total);
+    Color c = Color::Green;
+    if (is_red(c)) {
+        tk_print_i32(1);
+    } else {
+        tk_print_i32(0);
+    }
+    return;
+}

@@ -1,0 +1,23 @@
+extern fn tk_print_i32(i32 x);
+
+fn sum(List<i32> xs) -> i32 {
+    mut i32 total = 0;
+    mut u64 i = 0;
+    while (i < xs.len) {
+        total += xs[i];
+        i++;
+    }
+    return total;
+}
+
+fn main() {
+    List<i32> xs = [10, 20, 30];
+    tk_print_i32(sum(xs));
+    xs.push(40);
+    tk_print_i32(sum(xs));
+    tk_print_i32(xs[0]);
+    List<i32> empty = [];
+    empty.push(7);
+    tk_print_i32(empty[0]);
+    return;
+}

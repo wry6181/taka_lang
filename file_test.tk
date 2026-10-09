@@ -1,0 +1,68 @@
+// Taka-written arena + file layer (bump allocator over malloc'd memory,
+// file reading via C stdio helpers). Reusable std sections marked below.
+extern fn tk_malloc(u64 n) -> u8*;
+extern fn tk_free(u8* p);
+extern fn tk_fopen(char* path, char* mode) -> u8*;
+extern fn tk_fclose(u8* f) -> i32;
+extern fn tk_fseek(u8* f, i64 off, i32 whence) -> i32;
+extern fn tk_ftell(u8* f) -> i64;
+extern fn tk_fread(u8* dst, u64 sz, u64 n, u8* f) -> u64;
+extern fn tk_print_i32(i32 x);
+
+// ---- std: bump arena ----
+struct Arena { u8* buf, u64 cap, u64 pos, }
+
+fn arena_mk(u8* buf, u64 cap) -> Arena {
+    Arena a = Arena { buf: buf, cap: cap, pos: 0, };
+    return a;
+}
+
+fn arena_alloc(Arena* a, u64 n) -> u8* {
+    u64 start = (a.pos + 7) / 8 * 8;
+    u64 end = start + n;
+    if (end > a.cap) {
+        return null;
+    }
+    a.pos = end;
+    return a.buf + start;
+}
+
+// ---- std: whole-file read into the arena ----
+struct FileData { u8* data, u64 len, }
+
+fn read_file(char* path, Arena* a) -> FileData {
+    u8* f = tk_fopen(path, "r");
+    if (f == null) {
+        FileData bad = FileData { data: null, len: 0, };
+        return bad;
+    }
+    tk_fseek(f, 0, 2);
+    i64 size = tk_ftell(f);
+    tk_fseek(f, 0, 0);
+    u64 n = size as u64;
+    u8* data = arena_alloc(a, n);
+    if (data == null) {
+        tk_fclose(f);
+        FileData bad2 = FileData { data: null, len: 0, };
+        return bad2;
+    }
+    u64 got = tk_fread(data, 1, n, f);
+    tk_fclose(f);
+    FileData ok = FileData { data: data, len: got, };
+    return ok;
+}
+
+fn main() {
+    u8* buf = tk_malloc(4096);
+    if (buf == null) {
+        return;
+    }
+    Arena ar = arena_mk(buf, 4096);
+    FileData fd = read_file("file_fixture.txt", &ar);
+    tk_print_i32(fd.len as i32);
+    if (fd.len > 0) {
+        tk_print_i32(fd.data[0] as i32);
+    }
+    tk_free(buf);
+    return;
+}

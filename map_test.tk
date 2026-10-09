@@ -1,0 +1,304 @@
+extern fn tk_print_i32(i32 x);
+extern fn tk_malloc(u64 n) -> u8*;
+extern fn tk_free(u8* p);
+extern fn tk_streq(char* a, char* b) -> bool;
+extern fn tk_strlen(char* s) -> u64;
+
+struct Arena { u8* buf, u64 cap, u64 pos, }
+
+fn arena_mk(u8* buf, u64 cap) -> Arena {
+    Arena a = Arena { buf: buf, cap: cap, pos: 0, };
+    return a;
+}
+
+fn arena_alloc(Arena* a, u64 n) -> u8* {
+    u64 start = (a.pos + 7) / 8 * 8;
+    u64 end = start + n;
+    if (end > a.cap) {
+        return null;
+    }
+    a.pos = end;
+    return a.buf + start;
+}
+
+struct StrEntry { char* key, u64 hash, u8* val, u64 dist, bool used, }
+struct StrMap { List<StrEntry> slots, u64 len, }
+
+fn str_hash(char* s) -> u64 {
+    mut u64 h = 1469598103934665603;
+    mut u64 i = 0;
+    while (s[i] != 0) {
+        h = (h ^ s[i] as u64) * 1099511628211;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn slots_put(List<StrEntry>* slots, char* key, u64 h, u8* val) -> bool {
+    mut u64 idx = h % slots.cap;
+    mut char* ck = key;
+    mut u64 ch = h;
+    mut u8* cv = val;
+    mut u64 cd = 0;
+    while (true) {
+        StrEntry* e = &slots.data[idx];
+        if (!e.used) {
+            e.key = ck;
+            e.hash = ch;
+            e.val = cv;
+            e.dist = cd;
+            e.used = true;
+            return true;
+        }
+        if (e.hash == ch) {
+            if (tk_streq(e.key, ck)) {
+                e.val = cv;
+                return false;
+            }
+        }
+        if (e.dist < cd) {
+            char* tk2 = e.key;
+            u64 th = e.hash;
+            u8* tv = e.val;
+            u64 td = e.dist;
+            e.key = ck;
+            e.hash = ch;
+            e.val = cv;
+            e.dist = cd;
+            ck = tk2;
+            ch = th;
+            cv = tv;
+            cd = td;
+        }
+        idx = idx + 1;
+        if (idx == slots.cap) {
+            idx = 0;
+        }
+        cd = cd + 1;
+    }
+}
+
+fn strmap_mk() -> StrMap {
+    List<StrEntry> s = [];
+    mut u64 i = 0;
+    while (i < 16) {
+        StrEntry e = StrEntry { key: null, hash: 0, val: null, dist: 0, used: false, };
+        s.push(e);
+        i = i + 1;
+    }
+    StrMap m = StrMap { slots: s, len: 0, };
+    return m;
+}
+
+fn strmap_grow(StrMap* m) {
+    u64 oldcap = m.slots.cap;
+    StrEntry* old = m.slots.data;
+    List<StrEntry> ns = [];
+    mut u64 i = 0;
+    while (i < oldcap + oldcap) {
+        StrEntry e = StrEntry { key: null, hash: 0, val: null, dist: 0, used: false, };
+        ns.push(e);
+        i = i + 1;
+    }
+    mut u64 r = 0;
+    while (r < oldcap) {
+        StrEntry src = old[r];
+        if (src.used) {
+            slots_put(&ns, src.key, src.hash, src.val);
+        }
+        r = r + 1;
+    }
+    m.slots = ns;
+}
+
+fn strmap_put(StrMap* m, char* key, u8* val) {
+    if ((m.len + 1) * 10 > m.slots.cap * 7) {
+        strmap_grow(m);
+    }
+    bool fresh = slots_put(&m.slots, key, str_hash(key), val);
+    if (fresh) {
+        m.len = m.len + 1;
+    }
+}
+
+fn strmap_get(StrMap* m, char* key) -> u8* {
+    u64 h = str_hash(key);
+    mut u64 idx = h % m.slots.cap;
+    mut u64 dist = 0;
+    while (true) {
+        StrEntry* e = &m.slots.data[idx];
+        if (!e.used) {
+            return null;
+        }
+        if (e.dist < dist) {
+            return null;
+        }
+        if (e.hash == h) {
+            if (tk_streq(e.key, key)) {
+                return e.val;
+            }
+        }
+        idx = idx + 1;
+        if (idx == m.slots.cap) {
+            idx = 0;
+        }
+        dist = dist + 1;
+    }
+}
+
+fn strmap_remove(StrMap* m, char* key) -> bool {
+    u64 h = str_hash(key);
+    mut u64 idx = h % m.slots.cap;
+    mut u64 dist = 0;
+    while (true) {
+        StrEntry* e = &m.slots.data[idx];
+        if (!e.used) {
+            return false;
+        }
+        if (e.dist < dist) {
+            return false;
+        }
+        if (e.hash == h) {
+            if (tk_streq(e.key, key)) {
+                mut u64 j = idx;
+                while (true) {
+                    mut u64 nxt = j + 1;
+                    if (nxt == m.slots.cap) {
+                        nxt = 0;
+                    }
+                    StrEntry* n = &m.slots.data[nxt];
+                    if (!n.used) {
+                        break;
+                    }
+                    if (n.dist == 0) {
+                        break;
+                    }
+                    StrEntry* c = &m.slots.data[j];
+                    c.key = n.key;
+                    c.hash = n.hash;
+                    c.val = n.val;
+                    c.dist = n.dist - 1;
+                    j = nxt;
+                }
+                StrEntry* last = &m.slots.data[j];
+                last.used = false;
+                m.len = m.len - 1;
+                return true;
+            }
+        }
+        idx = idx + 1;
+        if (idx == m.slots.cap) {
+            idx = 0;
+        }
+        dist = dist + 1;
+    }
+}
+
+extern fn tk_sview_u8(u8* p, u64 n) -> sview;
+
+fn i32_to_str(i32 x, Arena* a) -> sview {
+    u8* buf = arena_alloc(a, 12);
+    bool neg = x < 0;
+    mut u64 n = x as u64;
+    if (neg) {
+        n = (0 - x) as u64;
+    }
+    mut u64 end = 12;
+    if (n == 0) {
+        end = end - 1;
+        buf[end] = 48;
+    }
+    while (n > 0) {
+        u64 d = n % 10;
+        n = n / 10;
+        end = end - 1;
+        buf[end] = (48 + d) as u8;
+    }
+    mut u64 at = end;
+    if (neg) {
+        at = at - 1;
+        buf[at] = 45;
+    }
+    u64 len = 12 - at;
+    sview s = tk_sview_u8(buf + at, len);
+    return s;
+}
+
+fn str_cat(char* x, u64 xn, char* y, u64 yn, Arena* a) -> char* {
+    u64 total = xn + yn;
+    u8* buf = arena_alloc(a, total + 1);
+    mut u64 i = 0;
+    while (i < xn) {
+        buf[i] = x[i];
+        i = i + 1;
+    }
+    mut u64 j = 0;
+    while (j < yn) {
+        buf[xn + j] = y[j];
+        j = j + 1;
+    }
+    buf[total] = 0;
+    return buf as char*;
+}
+
+fn main() {
+    StrMap m = strmap_mk();
+    strmap_put(&m, "alpha", 1 as u8*);
+    strmap_put(&m, "beta", 2 as u8*);
+    strmap_put(&m, "gamma", 3 as u8*);
+    u64 a = strmap_get(&m, "alpha") as u64;
+    u64 b = strmap_get(&m, "beta") as u64;
+    tk_print_i32(a as i32);
+    tk_print_i32(b as i32);
+    strmap_put(&m, "alpha", 10 as u8*);
+    u64 a2 = strmap_get(&m, "alpha") as u64;
+    tk_print_i32(a2 as i32);
+    bool gone = strmap_remove(&m, "beta");
+    tk_print_i32(gone as i32);
+    u64 b2 = strmap_get(&m, "beta") as u64;
+    tk_print_i32(b2 as i32);
+    tk_print_i32(m.len as i32);
+    u8* memb = tk_malloc(65536);
+    Arena ar2 = arena_mk(memb, 65536);
+    StrMap big = strmap_mk();
+    mut i32 k = 0;
+    while (k < 200) {
+        u8* m2 = tk_malloc(64);
+        Arena t = arena_mk(m2, 64);
+        sview d = i32_to_str(k, &t);
+        char* key = str_cat("k", 1, d.ptr, d.len as u64, &ar2);
+        strmap_put(&big, key, (k as u64 + 1) as u8*);
+        tk_free(m2);
+        k = k + 1;
+    }
+    tk_print_i32(big.len as i32);
+    u8* m3 = tk_malloc(64);
+    Arena t3 = arena_mk(m3, 64);
+    sview d0 = i32_to_str(0, &t3);
+    char* q0 = str_cat("k", 1, d0.ptr, d0.len as u64, &ar2);
+    u64 g0 = strmap_get(&big, q0) as u64;
+    tk_print_i32(g0 as i32);
+    tk_free(m3);
+    mut i32 r = 0;
+    while (r < 200) {
+        u8* m4 = tk_malloc(64);
+        Arena t4 = arena_mk(m4, 64);
+        sview dr = i32_to_str(r, &t4);
+        char* qr = str_cat("k", 1, dr.ptr, dr.len as u64, &ar2);
+        if (r % 2 == 0) {
+            strmap_remove(&big, qr);
+        }
+        tk_free(m4);
+        r = r + 1;
+    }
+    tk_print_i32(big.len as i32);
+    u8* m5 = tk_malloc(64);
+    Arena t5 = arena_mk(m5, 64);
+    sview d1 = i32_to_str(1, &t5);
+    char* q1 = str_cat("k", 1, d1.ptr, d1.len as u64, &ar2);
+    u64 g1 = strmap_get(&big, q1) as u64;
+    tk_print_i32(g1 as i32);
+    tk_free(m5);
+    tk_free(memb);
+    return;
+}

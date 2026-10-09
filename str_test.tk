@@ -1,0 +1,119 @@
+extern fn tk_print_i32(i32 x);
+extern fn tk_malloc(u64 n) -> u8*;
+extern fn tk_free(u8* p);
+extern fn tk_fopen(char* path, char* mode) -> u8*;
+extern fn tk_fclose(u8* f) -> i32;
+extern fn tk_fwrite(u8* src, u64 sz, u64 n, u8* f) -> u64;
+extern fn tk_fseek(u8* f, i64 off, i32 whence) -> i32;
+extern fn tk_ftell(u8* f) -> i64;
+extern fn tk_fread(u8* dst, u64 sz, u64 n, u8* f) -> u64;
+extern fn tk_sview(char* p, u64 n) -> sview;
+extern fn tk_sview_u8(u8* p, u64 n) -> sview;
+
+struct Arena { u8* buf, u64 cap, u64 pos, }
+
+fn arena_mk(u8* buf, u64 cap) -> Arena {
+    Arena a = Arena { buf: buf, cap: cap, pos: 0, };
+    return a;
+}
+
+fn arena_alloc(Arena* a, u64 n) -> u8* {
+    u64 start = (a.pos + 7) / 8 * 8;
+    u64 end = start + n;
+    if (end > a.cap) {
+        return null;
+    }
+    a.pos = end;
+    return a.buf + start;
+}
+
+fn str_eq(sview a, sview b) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    mut u64 i = 0;
+    while (i < a.len as u64) {
+        if (a.ptr[i] != b.ptr[i]) {
+            return false;
+        }
+        i++;
+    }
+    return true;
+}
+
+fn i32_to_str(i32 x, Arena* a) -> sview {
+    u8* buf = arena_alloc(a, 12);
+    bool neg = x < 0;
+    mut u64 n = x as u64;
+    if (neg) {
+        n = (0 - x) as u64;
+    }
+    mut u64 end = 12;
+    if (n == 0) {
+        end = end - 1;
+        buf[end] = 48;
+    }
+    while (n > 0) {
+        u64 d = n % 10;
+        n = n / 10;
+        end = end - 1;
+        buf[end] = (48 + d) as u8;
+    }
+    mut u64 at = end;
+    if (neg) {
+        at = at - 1;
+        buf[at] = 45;
+    }
+    u64 len = 12 - at;
+    sview s = tk_sview_u8(buf + at, len);
+    return s;
+}
+
+struct FileData { u8* data, u64 len, }
+
+fn read_all(char* path, Arena* a) -> FileData {
+    u8* f = tk_fopen(path, "r");
+    if (f == null) {
+        FileData bad = FileData { data: null, len: 0, };
+        return bad;
+    }
+    tk_fseek(f, 0, 2);
+    i64 size = tk_ftell(f);
+    tk_fseek(f, 0, 0);
+    u64 n = size as u64;
+    u8* data = arena_alloc(a, n);
+    u64 got = tk_fread(data, 1, n, f);
+    tk_fclose(f);
+    FileData ok = FileData { data: data, len: got, };
+    return ok;
+}
+
+fn main() {
+    u8* mem = tk_malloc(512);
+    Arena ar = arena_mk(mem, 512);
+    sview z = i32_to_str(0, &ar);
+    sview a = i32_to_str(42, &ar);
+    sview b = i32_to_str(0 - 7, &ar);
+    tk_print_i32(str_eq(z, tk_sview("0", 1)) as i32);
+    tk_print_i32(str_eq(a, tk_sview("42", 2)) as i32);
+    tk_print_i32(str_eq(b, tk_sview("-7", 2)) as i32);
+    tk_print_i32(str_eq(a, b) as i32);
+    u8* f = tk_fopen("str_out.txt", "w");
+    List<u8> out = [104, 105, 32];
+    sview num = i32_to_str(42, &ar);
+    mut u64 j = 0;
+    while (j < num.len as u64) {
+        out.push(num.ptr[j]);
+        j = j + 1;
+    }
+    out.push(10);
+    tk_fwrite(out.data, 1, out.len, f);
+    tk_fclose(f);
+    FileData back = read_all("str_out.txt", &ar);
+    tk_print_i32(back.len as i32);
+    sview want = tk_sview("hi 42\n", 6);
+    sview got = tk_sview_u8(back.data, back.len);
+    tk_print_i32(str_eq(got, want) as i32);
+    tk_free(mem);
+    return;
+}

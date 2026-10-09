@@ -1,0 +1,26 @@
+extern fn tk_print_i32(i32 x);
+extern fn tk_print_str(char* s);
+
+fn id(i32 v) -> i32 {
+    return v;
+}
+
+struct Point { i32 x, i32 y, }
+
+fn main() {
+    i32 x = 1;
+    {
+        i32 x = 2;
+        tk_print_i32(x);
+    }
+    tk_print_i32(x);
+    auto y = 40 + 2;
+    tk_print_i32(y);
+    auto z = id(9);
+    tk_print_i32(z);
+    auto p = Point { x: 3, y: 4, };
+    tk_print_i32(p.x + p.y);
+    auto s = "hi";
+    tk_print_str(s);
+    return;
+}
