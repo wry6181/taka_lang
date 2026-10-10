@@ -379,8 +379,60 @@ static void check_stmt(Scope *s, TkStmt *st) {
     // Defer bodies checked in backend phase (scope exits); simplified here.
 }
 
-int sema_check(TkProgram *prog, mem_arena *arena) {
-    errors = 0;
+// ---- infinite (by-value cyclic) type rejection ----
+// A struct/enum containing itself by value (through any chain of by-value
+// fields) would be infinitely large. Pointer/ref/List edges are finite
+// (8/24 bytes) and stop the search.
+static TkItem *sema_find_adt(const char *nm) {
+    if (!sema_prog || !nm) return NULL;
+    for (int i = 0; i < sema_prog->count; i++) {
+        TkItem *it = sema_prog->items[i];
+        if (it->kind == TK_IT_STRUCT && it->sname && !strcmp(it->sname, nm)) return it;
+        if (it->kind == TK_IT_ENUM && it->ename && !strcmp(it->ename, nm)) return it;
+    }
+    return NULL;
+}
+// by-value type names on the current search path
+static const char *fin_path[64];
+static int fin_depth = 0;
+// true if using t by value reaches a by-value cycle
+static int type_reaches_cycle(TkType *t) {
+    if (!t) return 0;
+    if (t->stars > 0 || t->is_ref) return 0; // finite edge
+    switch (t->kind) {
+        case TK_TY_PRIM: case TK_TY_AUTO: case TK_TY_FN: case TK_TY_DYN:
+            return 0;
+        case TK_TY_TUPLE:
+            for (int i = 0; i < t->ecount; i++) if (type_reaches_cycle(t->elems[i])) return 1;
+            return 0;
+        case TK_TY_ARRAY:
+            return type_reaches_cycle(t->elem);
+        case TK_TY_PATH: {
+            if (t->path.count == 1 && !strcmp(t->path.segs[0].seg, "List") && t->gcount == 1) return 0; // fat pointer
+            if (t->path.count != 1) return 0; // qualified/unknown: reported elsewhere
+            const char *nm = t->path.segs[0].seg;
+            for (int i = 0; i < fin_depth; i++) if (!strcmp(fin_path[i], nm)) return 1; // cycle
+            TkItem *it = sema_find_adt(nm);
+            if (!it) return 0; // unknown: reported elsewhere
+            if (fin_depth >= 64) return 1; // pathological nesting: reject
+            fin_path[fin_depth++] = nm;
+            int bad = 0;
+            if (it->kind == TK_IT_STRUCT) {
+                for (int j = 0; j < it->fcount && !bad; j++) bad = type_reaches_cycle(it->fields[j].ty);
+            } else if (it->kind == TK_IT_ENUM) {
+                for (int j = 0; j < it->vcount && !bad; j++) {
+                    if (it->vars[j].has_tuple) for (int k = 0; k < it->vars[j].tn && !bad; k++) bad = type_reaches_cycle(it->vars[j].ts[k]);
+                    if (it->vars[j].has_struct) for (int k = 0; k < it->vars[j].fn2 && !bad; k++) bad = type_reaches_cycle(it->vars[j].fs[k].ty);
+                }
+            }
+            fin_depth--;
+            return bad;
+        }
+        default: return 0;
+    }
+}
+
+int sema_check(TkProgram *prog, mem_arena *arena) {    errors = 0;
     sema_prog = prog;
     Scope *glob = scope_new(arena, NULL);
     // pre-populate function/global names so calls resolve
@@ -422,6 +474,22 @@ int sema_check(TkProgram *prog, mem_arena *arena) {
             int has_pay=0, has_disc=0;
             for(int j=0;j<it->vcount;j++){ if(it->vars[j].has_tuple||it->vars[j].has_struct)has_pay=1; if(it->vars[j].has_disc)has_disc=1; }
             if(has_pay&&has_disc) err("enum payload and '= const' never coexist", it->ename);
+            fin_depth = 0;
+            fin_path[fin_depth++] = it->ename;
+            int bad = 0;
+            for(int j=0;j<it->vcount && !bad;j++){
+                if(it->vars[j].has_tuple) for(int k=0;k<it->vars[j].tn && !bad;k++) bad = type_reaches_cycle(it->vars[j].ts[k]);
+                if(it->vars[j].has_struct) for(int k=0;k<it->vars[j].fn2 && !bad;k++) bad = type_reaches_cycle(it->vars[j].fs[k].ty);
+            }
+            fin_depth = 0;
+            if (bad) err("enum contains itself by value (infinite size)", it->ename);
+        } else if (it->kind==TK_IT_STRUCT) {
+            fin_depth = 0;
+            fin_path[fin_depth++] = it->sname;
+            int bad = 0;
+            for (int j = 0; j < it->fcount && !bad; j++) bad = type_reaches_cycle(it->fields[j].ty);
+            fin_depth = 0;
+            if (bad) err("struct contains itself by value (infinite size)", it->sname);
         }
     }
     return errors ? 1 : 0;

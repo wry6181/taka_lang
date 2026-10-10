@@ -1875,7 +1875,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    mem_arena *arena = arena_create(MByte(1));
+    mem_arena *arena = arena_create(MByte(8));
     if (!arena) { fprintf(stderr, "arena_create failed\n"); return 1; }
 
     const char *src = read_file(arena, infile);

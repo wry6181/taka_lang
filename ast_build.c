@@ -35,7 +35,7 @@ static char *dupstr(B*b,const char*s,int n){
     char*o=(char*)arena_push(b->a,(u64)n+1,0); memcpy(o,s,(size_t)n); o[n]=0; return o;
 }
 static char *tokstr(B*b,Token*t){ return dupstr(b,t->start,(int)t->len); }
-static void *push(B*b,int sz){ void*p=arena_push(b->a,(u64)sz,1); if(!p){b->err="OOM";} return p; }
+static void *push(B*b,int sz){ void*p=arena_push(b->a,(u64)sz,1); if(!p){ fprintf(stderr,"out of memory\n"); exit(1); } return p; }
 
 static TkType *b_type(B*b);
 static TkExpr *b_expr(B*b);

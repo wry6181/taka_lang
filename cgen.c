@@ -974,7 +974,7 @@ int cgen_emit(TkProgram *prog, const char *out_path) {
                 it->kind==TK_IT_TRAIT?"trait":it->kind==TK_IT_IMPL?"impl":it->kind==TK_IT_EFFECT?"effect":"handler");
         }
     }
-    fprintf(out,"\nint main(void){ taka_main(); return 0; }\n");
+    fprintf(out,"\nint main(int argc, char **argv){ tk_g_argc = argc; tk_g_argv = argv; taka_main(); return 0; }\n");
     // main mapping: taka `fn main()` has no args and may return void/i32; wrap.
     fclose(out);
     int rc = cg_failed ? 1 : 0;

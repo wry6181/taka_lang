@@ -1,0 +1,57 @@
+extern fn tk_print_i32(i32 x);
+extern fn tk_malloc(u64 n) -> u8*;
+
+struct Inner { u64 a, i32 b, }
+struct Outer { Inner inn, u64 tag, }
+enum Wrap { Hold(Inner), Empty, }
+
+fn sum8(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h) -> u64 {
+    return a + b + c + d + e + f + g + h;
+}
+
+fn two_structs(Inner p, Inner q, u64 k) -> u64 {
+    return p.a + q.a + p.b as u64 + q.b as u64 + k;
+}
+
+fn mk_outer(u64 a, i32 b, u64 t) -> Outer {
+    Outer o = Outer { inn: Inner { a: a, b: b, }, tag: t, };
+    return o;
+}
+
+fn unwrap(Wrap w) -> u64 {
+    mut u64 out = 0;
+    match w {
+        Wrap::Hold(x) => { out = x.a + x.b as u64; },
+        Wrap::Empty => { out = 0 - 1; },
+    }
+    return out;
+}
+
+fn cook(u64 x) -> u64 { return x * 2 + 1; }
+
+fn main() {
+    tk_print_i32(sum8(1, 2, 3, 4, 5, 6, 7, 8) as i32);
+    Inner p = Inner { a: 100, b: 1, };
+    Inner q = Inner { a: 200, b: 2, };
+    tk_print_i32(two_structs(p, q, 3) as i32);
+    Outer o = mk_outer(10, 20, 30);
+    tk_print_i32(o.inn.a as i32);
+    tk_print_i32(o.inn.b);
+    tk_print_i32(o.tag as i32);
+    Wrap w = Wrap::Hold(p);
+    tk_print_i32(unwrap(w) as i32);
+    mut u64 m = 0;
+    m = m - 1;
+    tk_print_i32((m % 10) as i32);
+    tk_print_i32((m / m) as i32);
+    tk_print_i32((0 - 7) / 2);
+    tk_print_i32((0 - 7) % 2);
+    List<u64> l = [];
+    l.push(cook(21));
+    l.push(cook(cook(1)));
+    tk_print_i32(l.len as i32);
+    tk_print_i32(l.data[0] as i32);
+    tk_print_i32(l.data[1] as i32);
+    tk_print_i32(cook(cook(cook(1))) as i32);
+    return;
+}

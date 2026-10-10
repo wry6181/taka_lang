@@ -1,0 +1,20 @@
+extern fn tk_print_i32(i32 x);
+extern fn tk_argc() -> i32;
+extern fn tk_argv(i32 i) -> char*;
+extern fn tk_streq(char* a, char* b) -> bool;
+extern fn tk_system(char* cmd) -> i32;
+
+fn main() {
+    // run as: ./args_test hello  ->  2/1/1/0
+    tk_print_i32(tk_argc());
+    char* a1 = tk_argv(1);
+    if (a1 == null) {
+        tk_print_i32(-1);
+    } else {
+        tk_print_i32(tk_streq(a1, "hello") as i32);
+    }
+    char* oo = tk_argv(99);
+    tk_print_i32((oo == null) as i32);
+    tk_print_i32(tk_system("true"));
+    return;
+}

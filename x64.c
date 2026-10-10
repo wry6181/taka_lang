@@ -113,6 +113,7 @@ static int tmp_find(const void *node);
 static int ty_align(TkType *t);
 static int ty_size(TkType *t) {
     if (!t) return 8;
+    if (t->stars > 0 || t->is_ref) return 8; // pointers/refs are 8 bytes
     switch (t->kind) {
         case TK_TY_PRIM:
             switch (t->prim) {
@@ -150,6 +151,7 @@ static int ty_size(TkType *t) {
 }
 static int ty_align(TkType *t) {
     if (!t) return 8;
+    if (t->stars > 0 || t->is_ref) return 8; // pointers/refs align to 8
     if (t->kind == TK_TY_PRIM) {
         switch (t->prim) {
             case TOKEN_I8: case TOKEN_U8: case TOKEN_BOOL: case TOKEN_CHAR_TY: return 1;
@@ -183,6 +185,7 @@ static QW ty_width(TkType *t) {
             case TOKEN_U32: return Q_U32; case TOKEN_U64: return Q_U64;
             case TOKEN_BOOL: return Q_BOOL; case TOKEN_CHAR_TY: return Q_CHAR;
             case TOKEN_F32: return Q_F32; case TOKEN_F64: return Q_F64;
+            case TOKEN_SVIEW: return Q_STRUCT; // (ptr,len) pair: address convention like List
             default: return Q_I64;
         }
     }
@@ -271,6 +274,7 @@ static const char *abi_map(const char *nm) {
     if (!strcmp(nm, "tk_fwrite")) return "fwrite";
     if (!strcmp(nm, "tk_strlen")) return "strlen";
     if (!strcmp(nm, "tk_streq")) return "strcmp";
+    if (!strcmp(nm, "tk_system")) return "system";
     return nm;
 }
 static int is_print_like(const char *nm) {
@@ -442,7 +446,7 @@ static TkType *xinfer(TkExpr *e) {
         case TK_EX_FIELD: {
             TkType *bt = xinfer(e->callee);
             if (!bt) return NULL;
-            if (bt->kind == TK_TY_PRIM && bt->prim == TOKEN_SVIEW && !bt->stars && !bt->is_ref) {
+            if (bt->kind == TK_TY_PRIM && bt->prim == TOKEN_SVIEW) {
                 if (!strcmp(e->field, "ptr")) { TkType *t = xnew_prim(TOKEN_CHAR_TY); if (t) t->stars = 1; return t; }
                 if (!strcmp(e->field, "len")) return xnew_prim(TOKEN_I64);
                 return NULL;
@@ -768,7 +772,7 @@ static void xv_add_global(char *name, TkType *ty) {
 // field byte offset within a value type (struct/sview/List/payload handled by callers)
 static int field_offset(TkType *bt, const char *field) {
     if (!bt) { Xerr("field of unknown type"); return 0; }
-    if (bt->kind == TK_TY_PRIM && bt->prim == TOKEN_SVIEW && !bt->stars && !bt->is_ref) {
+    if (bt->kind == TK_TY_PRIM && bt->prim == TOKEN_SVIEW) {
         if (!strcmp(field, "ptr")) return 0;
         if (!strcmp(field, "len")) return 8;
         Xerr("unknown sview field");
@@ -841,8 +845,11 @@ static void emit_addr(TkExpr *e) {
             Xerr("address of non-place");
             return;
         case TK_EX_FIELD: {
-            emit_addr(e->callee);
             TkType *bt = xinfer(e->callee);
+            // one-level auto-deref (grammar 15): pointer/ref base uses the
+            // loaded pointer, matching the C backend's `->` (cgen.c TK_EX_FIELD).
+            if (bt && (bt->stars > 0 || bt->is_ref)) emit_val(e->callee);
+            else emit_addr(e->callee);
             int off = field_offset(bt, e->field);
             if (off) fprintf(o, "    addq $%d, %%rax\n", off);
             return;
@@ -857,7 +864,9 @@ static void emit_addr(TkExpr *e) {
             TkType *et = xinfer(e);
             int esz = et ? ty_size(et) : 8;
             if (esz <= 0) esz = 8;
-            emit_addr(e->callee);
+            // pointer/ref base: index the loaded pointer (see FIELD auto-deref above)
+            if (bt && (bt->stars > 0 || bt->is_ref)) emit_val(e->callee);
+            else emit_addr(e->callee);
             if (bt && bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1)
                 fprintf(o, "    movq (%%rax), %%rax\n"); // List base -> data pointer (offset 0)
             fprintf(o, "    pushq %%rax\n");
@@ -996,6 +1005,12 @@ static void emit_val(TkExpr *e) {
                         fprintf(o, "    movss %%xmm0, (%%rcx)\n");
                     } else if (fw == Q_F64) {
                         fprintf(o, "    movsd %%xmm0, (%%rcx)\n");
+                    } else if (fw == Q_STRUCT) {
+                        // struct-typed field: RAX holds the value address
+                        int esz = ty_size(st->ft[fi]);
+                        fprintf(o, "    movq %%rax, %%rsi\n");
+                        fprintf(o, "    movq %%rcx, %%rdi\n");
+                        fprintf(o, "    movl $%d, %%ecx\n    rep movsb\n", esz);
                     } else {
                         char m[80];
                         snprintf(m, sizeof m, "(%%rcx)");
@@ -1021,6 +1036,12 @@ static void emit_val(TkExpr *e) {
                     if (fw == Q_F32 || fw == Q_F64) {
                         if (fw == Q_F32) fprintf(o, "    movss %%xmm0, (%%rcx)\n");
                         else fprintf(o, "    movsd %%xmm0, (%%rcx)\n");
+                    } else if (fw == Q_STRUCT) {
+                        // struct-typed variant field: RAX holds the value address
+                        int esz = ty_size(en->vars[vi].st[fj]);
+                        fprintf(o, "    movq %%rax, %%rsi\n");
+                        fprintf(o, "    movq %%rcx, %%rdi\n");
+                        fprintf(o, "    movl $%d, %%ecx\n    rep movsb\n", esz);
                     } else {
                         char m[80];
                         snprintf(m, sizeof m, "(%%rcx)");
@@ -1220,7 +1241,12 @@ static void emit_val(TkExpr *e) {
                     break;
                 case TOKEN_SLASH: case TOKEN_PERCENT: {
                     int isdiv = (e->op == TOKEN_SLASH);
-                    int uns = (w == Q_U64 || w == Q_U32);
+                    // C usual conversions: any unsigned (or pointer) operand
+                    // forces unsigned division (result width w is I64 for all
+                    // 64-bit operands, so it cannot drive this choice).
+                    int uns = (lw == Q_U64 || lw == Q_U32 || lw == Q_U16 || lw == Q_U8 ||
+                               rw == Q_U64 || rw == Q_U32 || rw == Q_U16 || rw == Q_U8 ||
+                               lw == Q_PTR || rw == Q_PTR);
                     if (!strcmp(suf, "q")) {
                         if (uns) fprintf(o, "    xorl %%edx, %%edx\n    divq %%rcx\n");
                         else fprintf(o, "    cqo\n    idivq %%rcx\n");
@@ -1280,6 +1306,18 @@ static void emit_val(TkExpr *e) {
                     break;
                 }
                 default: Xerr("bad binary op"); break;
+            }
+            // 32-bit producers must canonicalize: wider consumers (64-bit
+            // div, calls, stores) read full RAX. Sign-extend signed widths,
+            // zero-extend unsigned (comparisons already yield 0/1).
+            if (!strcmp(suf, "l") && e->op != TOKEN_EQEQ && e->op != TOKEN_BANGEQ &&
+                e->op != TOKEN_LT && e->op != TOKEN_GT && e->op != TOKEN_LTEQ && e->op != TOKEN_GTEQ) {
+                if (w == Q_I8 || w == Q_CHAR) fprintf(o, "    movsbq %%al, %%rax\n");
+                else if (w == Q_U8 || w == Q_BOOL) fprintf(o, "    movzbq %%al, %%rax\n");
+                else if (w == Q_I16) fprintf(o, "    movswq %%ax, %%rax\n");
+                else if (w == Q_U16) fprintf(o, "    movzwq %%ax, %%rax\n");
+                else if (w == Q_I32) fprintf(o, "    movslq %%eax, %%rax\n");
+                else fprintf(o, "    movl %%eax, %%eax\n");
             }
             break;
         }
@@ -1490,6 +1528,42 @@ static void arg_home(int i, TkType *formal, int *ipos, int *fpos, int *spos, int
     }
 }
 
+static void emit_call(TkExpr *e);
+// true if evaluating e may execute a call (which reuses the shared argtmp
+// area); call args containing calls are staged through private temps.
+static int expr_may_call(TkExpr *e) {
+    if (!e) return 0;
+    switch (e->kind) {
+        case TK_EX_INT: case TK_EX_FLOAT: case TK_EX_STRING: case TK_EX_CHAR:
+        case TK_EX_BOOL: case TK_EX_NULL: case TK_EX_UNDEF: case TK_EX_VAR:
+            return 0;
+        case TK_EX_CALL: return 1;
+        case TK_EX_PAREN: case TK_EX_CAST: case TK_EX_SIZEOF:
+            return expr_may_call(e->lhs) || expr_may_call(e->sizeof_ex);
+        case TK_EX_OFFSETOF:
+            return expr_may_call(e->off_ex_bare);
+        case TK_EX_UNARY: case TK_EX_POST_INC: case TK_EX_POST_DEC:
+            return expr_may_call(e->lhs);
+        case TK_EX_BINARY:
+            return expr_may_call(e->lhs) || expr_may_call(e->rhs);
+        case TK_EX_TERNARY:
+            return expr_may_call(e->cond) || expr_may_call(e->then_e) || expr_may_call(e->else_e);
+        case TK_EX_INDEX:
+            return expr_may_call(e->callee) || expr_may_call(e->index);
+        case TK_EX_FIELD:
+            return expr_may_call(e->callee);
+        case TK_EX_STRUCT_LIT:
+            for (int i = 0; i < e->scount; i++) if (expr_may_call(e->sfields[i].e)) return 1;
+            return 0;
+        case TK_EX_ARRAY_LIST:
+            for (int i = 0; i < e->ecount; i++) if (expr_may_call(e->elems[i])) return 1;
+            return 0;
+        case TK_EX_ARRAY_FILL:
+            return expr_may_call(e->fill_elem) || expr_may_call(e->fill_n);
+        default: return 1; // MATCH/IF/BLOCK/LAMBDA/effects/...: conservative
+    }
+}
+
 static void emit_call(TkExpr *e) {
     // List push: `xs.push(v)` -> List_T_push(&base, v)
     if (e->callee && e->callee->kind == TK_EX_FIELD && !strcmp(e->callee->field, "push") && e->callee->callee) {
@@ -1498,11 +1572,36 @@ static void emit_call(TkExpr *e) {
             if (e->nargs != 1) { Xerr("push takes exactly one arg"); return; }
             TkType *et = bt->gargs[0];
             QW ew = ty_width(et);
-            emit_addr(e->callee->callee);
+            // stage through private temps if a nested call could clobber the
+            // shared argtmp area between receiver/arg evaluation.
+            int protect = expr_may_call(e->callee->callee) || expr_may_call(e->args[0]);
+            int ts0 = -1, ts1 = -1;
+            char tm0[64], tm1[64];
+            if (protect) {
+                ts0 = tmp_slot(1);
+                snprintf(tm0, sizeof tm0, "%d(%%rbp)", SLOT(ts0));
+                emit_addr(e->callee->callee);
+                fprintf(o, "    movq %%rax, %s\n", tm0);
+                ts1 = tmp_slot(1);
+                snprintf(tm1, sizeof tm1, "%d(%%rbp)", SLOT(ts1));
+                emit_val(e->args[0]);
+                if (ew == Q_F32) fprintf(o, "    movss %%xmm0, %s\n", tm1);
+                else if (ew == Q_F64) fprintf(o, "    movsd %%xmm0, %s\n", tm1);
+                else fprintf(o, "    movq %%rax, %s\n", tm1);
+                fprintf(o, "    movq %s, %%rax\n", tm0);
+            } else {
+                emit_addr(e->callee->callee);
+            }
             char a0[64];
             snprintf(a0, sizeof a0, "%d(%%rbp)", SLOT(g_argBase));
             fprintf(o, "    movq %%rax, %s\n", a0);
-            emit_val(e->args[0]);
+            if (protect) {
+                if (ew == Q_F32) fprintf(o, "    movss %s, %%xmm0\n", tm1);
+                else if (ew == Q_F64) fprintf(o, "    movsd %s, %%xmm0\n", tm1);
+                else fprintf(o, "    movq %s, %%rax\n", tm1);
+            } else {
+                emit_val(e->args[0]);
+            }
             char a1[64];
             snprintf(a1, sizeof a1, "%d(%%rbp)", SLOT(g_argBase + 8 + 7));
             if (ew == Q_STRUCT) {
@@ -1616,7 +1715,49 @@ static void emit_call(TkExpr *e) {
     TkType *rt = fn->ret;
     QW rw = rt ? ty_width(rt) : Q_VOID;
     int sret = (!fn->is_ext && rw == Q_STRUCT);
-    for (int i = 0; i < e->nargs; i++) {
+    // stage args through private temps when a nested call could clobber an
+    // already-evaluated arg in the shared argtmp area.
+    int protect = 0;
+    for (int i = 0; i < e->nargs; i++) if (expr_may_call(e->args[i])) { protect = 1; break; }
+    // one private temp slot per arg (single bump: slots stay contiguous)
+    int tbase = (protect && e->nargs > 0) ? tmp_slot(e->nargs) : 0;
+    if (protect) {
+        for (int i = 0; i < e->nargs; i++) {
+            TkType *formal = fn->pt[i];
+            QW aw = formal ? ty_width(formal) : Q_I64;
+            char tm[64];
+            snprintf(tm, sizeof tm, "%d(%%rbp)", SLOT(tbase + i));
+            emit_val(e->args[i]);
+            if (aw == Q_F32) fprintf(o, "    movss %%xmm0, %s\n", tm);
+            else if (aw == Q_F64) fprintf(o, "    movsd %%xmm0, %s\n", tm);
+            else fprintf(o, "    movq %%rax, %s\n", tm);
+        }
+        for (int i = 0; i < e->nargs; i++) {
+            TkType *formal = fn->pt[i];
+            QW aw = formal ? ty_width(formal) : Q_I64;
+            char area[64];
+            snprintf(area, sizeof area, "%d(%%rbp)", SLOT(g_argBase + i * 8 + 7));
+            char tm[64];
+            snprintf(tm, sizeof tm, "%d(%%rbp)", SLOT(tbase + i));
+            if (aw == Q_STRUCT && formal) {
+                int esz = ty_size(formal);
+                fprintf(o, "    movq %s, %%rsi\n", tm);
+                fprintf(o, "    leaq %s, %%rdi\n", area);
+                fprintf(o, "    movl $%d, %%ecx\n    rep movsb\n", esz);
+            } else if (aw == Q_F32) {
+                fprintf(o, "    movss %s, %%xmm0\n", tm);
+                fprintf(o, "    movss %%xmm0, %s\n", area);
+            } else if (aw == Q_F64) {
+                fprintf(o, "    movsd %s, %%xmm0\n", tm);
+                fprintf(o, "    movsd %%xmm0, %s\n", area);
+            } else {
+                char m[96];
+                snprintf(m, sizeof m, "%s", area);
+                fprintf(o, "    movq %s, %%rax\n", tm);
+                store_mem(m, aw);
+            }
+        }
+    } else for (int i = 0; i < e->nargs; i++) {
         TkType *formal = fn->pt[i];
         QW fw = formal ? ty_width(formal) : Q_I64;
         char area[64];
@@ -1649,15 +1790,33 @@ static void emit_call(TkExpr *e) {
     int ipos = 0, fpos = 0, spos = 0;
     for (int i = 0; i < e->nargs; i++)
         arg_home(i, fn->pt[i], &ipos, &fpos, &spos, sret);
+    // stack-passed args (spos of them) live in outgoing frame slots; move
+    // them onto the real outgoing stack (last formal first). Pad when odd
+    // so rsp stays 16-aligned at the call.
+    int stk_total = 0;
+    if (spos > 0) {
+        stk_total = spos * 8;
+        if (spos & 1) { fprintf(o, "    subq $8, %%rsp\n"); stk_total += 8; }
+        for (int j = spos - 1; j >= 0; j--) {
+            char dst[64];
+            snprintf(dst, sizeof dst, "%d(%%rbp)", SLOT(g_outBase + j));
+            fprintf(o, "    pushq %s\n", dst);
+        }
+    }
     if (fn->is_ext) fprintf(o, "    call %s@PLT\n", abi_map(fn->name));
     else fprintf(o, "    call %s\n", fn->name);
+    if (stk_total > 0) fprintf(o, "    addq $%d, %%rsp\n", stk_total);
     if (sret) {
         char m[64];
         mem_slot(sret_slot, m, sizeof m);
         fprintf(o, "    leaq %s, %%rax\n", m);
     } else if (rw == Q_BOOL && fn->is_ext) {
-        // libc int used as taka bool: normalize to 0/1
-        fprintf(o, "    testl %%eax, %%eax\n    setne %%al\n    movzbq %%al, %%rax\n");
+        // libc int used as taka bool: normalize to 0/1.
+        // tk_streq maps to strcmp (0 means equal), so invert to taka polarity.
+        if (!strcmp(fn->name, "tk_streq"))
+            fprintf(o, "    testl %%eax, %%eax\n    sete %%al\n    movzbq %%al, %%rax\n");
+        else
+            fprintf(o, "    testl %%eax, %%eax\n    setne %%al\n    movzbq %%al, %%rax\n");
     } else if (fn->is_ext && (rw == Q_I8 || rw == Q_I16 || rw == Q_I32 || rw == Q_CHAR)) {
         fprintf(o, "    movslq %%eax, %%rax\n");
     } else if (fn->is_ext && (rw == Q_U8 || rw == Q_U16 || rw == Q_U32)) {
@@ -2197,6 +2356,14 @@ static void walk_expr(TkExpr *e) {
             walk_expr(e->callee);
             for (int i = 0; i < e->nargs; i++) walk_expr(e->args[i]);
             if (e->nargs > w_maxArgs) w_maxArgs = e->nargs;
+            // List push consumes an extra arg position for the receiver
+            // (&list in rdi); reserve it (mirrors emit_call's push lowering).
+            if (e->callee && e->callee->kind == TK_EX_FIELD && !strcmp(e->callee->field, "push") && e->callee->callee) {
+                TkType *bt = xinfer(e->callee->callee);
+                if (bt && bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1) {
+                    if (e->nargs + 1 > w_maxArgs) w_maxArgs = e->nargs + 1;
+                }
+            }
             if (e->callee && e->callee->kind == TK_EX_VAR && e->callee->path.count == 1 &&
                 !is_print_like(e->callee->path.segs[0].seg)) {
                 const char *cn = e->callee->path.segs[0].seg;
@@ -2997,6 +3164,9 @@ static void emit_fn(TkItem *it) {
         mem_slot(v->slot, dst, sizeof dst);
         if (pw == Q_STRUCT && pt) {
             int esz = ty_size(pt);
+            // rep movsb clobbers rsi/rdi/rcx: preserve all incoming int regs
+            // so later params (struct or scalar) still see their values.
+            fprintf(o, "    pushq %%rdi\n    pushq %%rsi\n    pushq %%rdx\n    pushq %%rcx\n    pushq %%r8\n    pushq %%r9\n");
             if (ipos < 6) {
                 fprintf(o, "    movq %s, %%rsi\n", ir[ipos]);
             } else {
@@ -3005,6 +3175,7 @@ static void emit_fn(TkItem *it) {
             }
             fprintf(o, "    leaq %s, %%rdi\n", dst);
             fprintf(o, "    movl $%d, %%ecx\n    rep movsb\n", esz);
+            fprintf(o, "    popq %%r9\n    popq %%r8\n    popq %%rcx\n    popq %%rdx\n    popq %%rsi\n    popq %%rdi\n");
             ipos++;
         } else if (pw == Q_F32 || pw == Q_F64) {
             if (fpos < 8) {
@@ -3110,9 +3281,26 @@ int x64_emit(TkProgram *prog, const char *out_path) {
         free(body);
     }
     emit_list_helpers();
+    // process-args runtime (tk_argc/tk_argv externs, C-ABI argc/argv saved here).
+    // Bounds behavior matches the C backend (NULL past either end).
+    fprintf(o, "    .data\n");
+    fprintf(o, "tk_rt_argc:\n    .long 0\n");
+    fprintf(o, "tk_rt_argv:\n    .quad 0\n");
+    fprintf(o, "    .text\n");
+    fprintf(o, "    .globl tk_argc\ntk_argc:\n");
+    fprintf(o, "    movl tk_rt_argc(%%rip), %%eax\n    ret\n");
+    fprintf(o, "    .globl tk_argv\ntk_argv:\n");
+    fprintf(o, "    movslq %%edi, %%rcx\n");
+    fprintf(o, "    testl %%ecx, %%ecx\n    js .Largv_null\n");
+    fprintf(o, "    cmpl tk_rt_argc(%%rip), %%ecx\n    jae .Largv_null\n");
+    fprintf(o, "    movq tk_rt_argv(%%rip), %%rax\n");
+    fprintf(o, "    movq (%%rax,%%rcx,8), %%rax\n    ret\n");
+    fprintf(o, ".Largv_null:\n    xorl %%eax, %%eax\n    ret\n");
     fprintf(o, "    .globl main\n");
     fprintf(o, "main:\n");
     fprintf(o, "    pushq %%rbp\n    movq %%rsp, %%rbp\n");
+    fprintf(o, "    movl %%edi, tk_rt_argc(%%rip)\n");
+    fprintf(o, "    movq %%rsi, tk_rt_argv(%%rip)\n");
     fprintf(o, "    call taka_main\n");
     fprintf(o, "    xorl %%eax, %%eax\n");
     fprintf(o, "    leave\n    ret\n");

@@ -1,0 +1,749 @@
+extern fn tk_print_i32(i32 x);
+extern fn tk_malloc(u64 n) -> u8*;
+extern fn tk_free(u8* p);
+extern fn tk_fopen(char* path, char* mode) -> u8*;
+extern fn tk_fclose(u8* f) -> i32;
+extern fn tk_fwrite(u8* src, u64 sz, u64 n, u8* f) -> u64;
+extern fn tk_fseek(u8* f, i64 off, i32 whence) -> i32;
+extern fn tk_ftell(u8* f) -> i64;
+extern fn tk_fread(u8* dst, u64 sz, u64 n, u8* f) -> u64;
+extern fn tk_sview(char* p, u64 n) -> sview;
+extern fn tk_sview_u8(u8* p, u64 n) -> sview;
+extern fn tk_argc() -> i32;
+extern fn tk_argv(i32 i) -> char*;
+
+struct Arena { u8* buf, u64 cap, u64 pos, }
+
+fn arena_mk(u8* buf, u64 cap) -> Arena {
+    Arena a = Arena { buf: buf, cap: cap, pos: 0, };
+    return a;
+}
+
+fn arena_alloc(Arena* a, u64 n) -> u8* {
+    u64 start = (a.pos + 7) / 8 * 8;
+    u64 end = start + n;
+    if (end > a.cap) {
+        return null;
+    }
+    a.pos = end;
+    return a.buf + start;
+}
+
+fn str_eq(sview a, sview b) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    mut u64 i = 0;
+    while (i < a.len as u64) {
+        if (a.ptr[i] != b.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+// ---- self-hosted lexer (stage 1): mirrors lexer.c ----
+
+struct TkTok { i32 kind, u8* start, u64 len, i32 line, i32 col, }
+struct TkLex { u8* src, u64 pos, i32 line, i32 col, }
+
+fn tk_peek(TkLex* lx) -> u8 {
+    return lx.src[lx.pos];
+}
+
+fn tk_peek2(TkLex* lx) -> u8 {
+    return lx.src[lx.pos + 1];
+}
+
+fn tk_peek3(TkLex* lx) -> u8 {
+    return lx.src[lx.pos + 2];
+}
+
+fn tk_advance(TkLex* lx) -> u8 {
+    u8 c = lx.src[lx.pos];
+    lx.pos = lx.pos + 1;
+    if (c == 10) {
+        lx.line = lx.line + 1;
+        lx.col = 1;
+    } else {
+        lx.col = lx.col + 1;
+    }
+    return c;
+}
+
+fn tk_make(TkLex* lx, i32 kind, u64 start, i32 line, i32 col) -> TkTok {
+    TkTok t = TkTok { kind: kind, start: lx.src + start, len: lx.pos - start, line: line, col: col, };
+    return t;
+}
+
+fn tk_is_alpha(u8 c) -> bool {
+    if (c >= 97 && c <= 122) { return true; }
+    if (c >= 65 && c <= 90) { return true; }
+    return false;
+}
+
+fn tk_is_digit(u8 c) -> bool {
+    if (c >= 48 && c <= 57) { return true; }
+    return false;
+}
+
+fn tk_is_alnum(u8 c) -> bool {
+    if (tk_is_alpha(c)) { return true; }
+    if (tk_is_digit(c)) { return true; }
+    return false;
+}
+
+fn tk_is_hexdig(u8 c) -> bool {
+    if (tk_is_digit(c)) { return true; }
+    if (c >= 97 && c <= 102) { return true; }
+    if (c >= 65 && c <= 70) { return true; }
+    return false;
+}
+
+fn tk_skip(TkLex* lx) {
+    while (true) {
+        u8 c = tk_peek(lx);
+        if (c == 32 || c == 9 || c == 13 || c == 10) {
+            tk_advance(lx);
+        } else if (c == 47 && tk_peek2(lx) == 47) {
+            while (tk_peek(lx) != 0 && tk_peek(lx) != 10) { tk_advance(lx); }
+        } else if (c == 47 && tk_peek2(lx) == 42) {
+            tk_advance(lx);
+            tk_advance(lx);
+            mut i32 depth = 1;
+            while (depth > 0 && tk_peek(lx) != 0) {
+                if (tk_peek(lx) == 47 && tk_peek2(lx) == 42) {
+                    tk_advance(lx);
+                    tk_advance(lx);
+                    depth = depth + 1;
+                } else if (tk_peek(lx) == 42 && tk_peek2(lx) == 47) {
+                    tk_advance(lx);
+                    tk_advance(lx);
+                    depth = depth - 1;
+                } else {
+                    tk_advance(lx);
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    return;
+}
+
+fn tk_match_suffix(TkLex* lx, sview s) -> bool {
+    mut u64 i = 0;
+    while (i < s.len as u64) {
+        if (lx.src[lx.pos + i] != s.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    u8 after = lx.src[lx.pos + i];
+    if (tk_is_alnum(after) || after == 95) {
+        return false;
+    }
+    mut u64 j = 0;
+    while (j < s.len as u64) {
+        tk_advance(lx);
+        j = j + 1;
+    }
+    return true;
+}
+
+fn tk_float_suffix(TkLex* lx) {
+    if (tk_peek(lx) == 102 && tk_peek2(lx) == 51 && tk_peek3(lx) == 50) {
+        u8 a = lx.src[lx.pos + 3];
+        if (!tk_is_alnum(a) && a != 95) {
+            tk_advance(lx);
+            tk_advance(lx);
+            tk_advance(lx);
+        }
+    } else if (tk_peek(lx) == 102 && tk_peek2(lx) == 54 && tk_peek3(lx) == 52) {
+        u8 a = lx.src[lx.pos + 3];
+        if (!tk_is_alnum(a) && a != 95) {
+            tk_advance(lx);
+            tk_advance(lx);
+            tk_advance(lx);
+        }
+    }
+    return;
+}
+
+fn tk_next(TkLex* lx) -> TkTok {
+    tk_skip(lx);
+    u64 start = lx.pos;
+    i32 line = lx.line;
+    i32 col = lx.col;
+    u8 c = tk_peek(lx);
+    if (c == 0) {
+        return tk_make(lx, K_EOF, start, line, col);
+    }
+    if (tk_is_alpha(c) || c == 95) {
+        tk_advance(lx);
+        while (tk_is_alnum(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+        u64 len = lx.pos - start;
+        if (len == 1 && lx.src[start] == 95) {
+            return tk_make(lx, K_WILDCARD, start, line, col);
+        }
+        sview w = tk_sview_u8(lx.src + start, len);
+        i32 k = tk_lookup_kw(w);
+        return tk_make(lx, k, start, line, col);
+    }
+    if (tk_is_digit(c)) {
+        if (c == 48 && (tk_peek2(lx) == 120 || tk_peek2(lx) == 88)) {
+            tk_advance(lx);
+            tk_advance(lx);
+            while (tk_is_hexdig(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+        } else if (c == 48 && (tk_peek2(lx) == 98 || tk_peek2(lx) == 66)) {
+            tk_advance(lx);
+            tk_advance(lx);
+            while (tk_peek(lx) == 48 || tk_peek(lx) == 49 || tk_peek(lx) == 95) { tk_advance(lx); }
+        } else {
+            while (tk_is_digit(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+            if (tk_peek(lx) == 46 && tk_is_digit(tk_peek2(lx))) {
+                tk_advance(lx);
+                while (tk_is_digit(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+                if (tk_peek(lx) == 101 || tk_peek(lx) == 69) {
+                    u64 save = lx.pos;
+                    i32 scol = lx.col;
+                    tk_advance(lx);
+                    if (tk_peek(lx) == 43 || tk_peek(lx) == 45) { tk_advance(lx); }
+                    if (!tk_is_digit(tk_peek(lx))) {
+                        lx.pos = save;
+                        lx.col = scol;
+                    } else {
+                        while (tk_is_digit(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+                    }
+                }
+                tk_float_suffix(lx);
+                return tk_make(lx, K_FLOAT, start, line, col);
+            }
+            if (tk_peek(lx) == 101 || tk_peek(lx) == 69) {
+                u64 save = lx.pos;
+                i32 scol = lx.col;
+                u8 n1 = tk_peek2(lx);
+                u8 n2 = lx.src[lx.pos + 2];
+                mut bool ok = false;
+                if (tk_is_digit(n1)) {
+                    ok = true;
+                } else if ((n1 == 43 || n1 == 45) && tk_is_digit(n2)) {
+                    ok = true;
+                }
+                if (ok) {
+                    tk_advance(lx);
+                    if (tk_peek(lx) == 43 || tk_peek(lx) == 45) { tk_advance(lx); }
+                    while (tk_is_digit(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+                    tk_float_suffix(lx);
+                    return tk_make(lx, K_FLOAT, start, line, col);
+                } else {
+                    lx.pos = save;
+                    lx.col = scol;
+                }
+            }
+        }
+        tk_match_suffix(lx, tk_sview("i8", 2));
+        tk_match_suffix(lx, tk_sview("i16", 3));
+        tk_match_suffix(lx, tk_sview("i32", 3));
+        tk_match_suffix(lx, tk_sview("i64", 3));
+        tk_match_suffix(lx, tk_sview("u8", 2));
+        tk_match_suffix(lx, tk_sview("u16", 3));
+        tk_match_suffix(lx, tk_sview("u32", 3));
+        tk_match_suffix(lx, tk_sview("u64", 3));
+        return tk_make(lx, K_INT, start, line, col);
+    }
+    if (c == 34) {
+        tk_advance(lx);
+        while (tk_peek(lx) != 0 && tk_peek(lx) != 34 && tk_peek(lx) != 10) {
+            if (tk_peek(lx) == 92) {
+                tk_advance(lx);
+                if (tk_peek(lx) != 0) { tk_advance(lx); }
+            } else {
+                tk_advance(lx);
+            }
+        }
+        if (tk_peek(lx) == 34) {
+            tk_advance(lx);
+            return tk_make(lx, K_STRING, start, line, col);
+        }
+        return tk_make(lx, K_ERROR, start, line, col);
+    }
+    if (c == 39) {
+        tk_advance(lx);
+        if (tk_peek(lx) == 92) {
+            tk_advance(lx);
+            if (tk_peek(lx) != 0) { tk_advance(lx); }
+        } else if (tk_peek(lx) != 0 && tk_peek(lx) != 39 && tk_peek(lx) != 10) {
+            tk_advance(lx);
+        }
+        if (tk_peek(lx) == 39) {
+            tk_advance(lx);
+            return tk_make(lx, K_CHAR, start, line, col);
+        }
+        return tk_make(lx, K_ERROR, start, line, col);
+    }
+    if (c == 60 && tk_peek2(lx) == 60 && lx.src[lx.pos + 2] == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SHL_EQ, start, line, col);
+    }
+    if (c == 62 && tk_peek2(lx) == 62 && lx.src[lx.pos + 2] == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SHR_EQ, start, line, col);
+    }
+    if (c == 58 && tk_peek2(lx) == 58) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_COLON2, start, line, col);
+    }
+    if (c == 45 && tk_peek2(lx) == 62) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_ARROW, start, line, col);
+    }
+    if (c == 61 && tk_peek2(lx) == 62) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_FATARROW, start, line, col);
+    }
+    if (c == 46 && tk_peek2(lx) == 46) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_DOTDOT, start, line, col);
+    }
+    if (c == 61 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_EQEQ, start, line, col);
+    }
+    if (c == 33 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_BANGEQ, start, line, col);
+    }
+    if (c == 60 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_LTEQ, start, line, col);
+    }
+    if (c == 62 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_GTEQ, start, line, col);
+    }
+    if (c == 60 && tk_peek2(lx) == 60) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SHL, start, line, col);
+    }
+    if (c == 62 && tk_peek2(lx) == 62) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SHR, start, line, col);
+    }
+    if (c == 38 && tk_peek2(lx) == 38) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_AMP2, start, line, col);
+    }
+    if (c == 124 && tk_peek2(lx) == 124) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PIPE2, start, line, col);
+    }
+    if (c == 43 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PLUS_EQ, start, line, col);
+    }
+    if (c == 45 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_MINUS_EQ, start, line, col);
+    }
+    if (c == 42 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_STAR_EQ, start, line, col);
+    }
+    if (c == 47 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SLASH_EQ, start, line, col);
+    }
+    if (c == 37 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PERCENT_EQ, start, line, col);
+    }
+    if (c == 38 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_AMP_EQ, start, line, col);
+    }
+    if (c == 124 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PIPE_EQ, start, line, col);
+    }
+    if (c == 94 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_CARET_EQ, start, line, col);
+    }
+    if (c == 43 && tk_peek2(lx) == 43) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PLUSPLUS, start, line, col);
+    }
+    if (c == 45 && tk_peek2(lx) == 45) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_MINUSMINUS, start, line, col);
+    }
+    if (c == 40) {
+        tk_advance(lx);
+        return tk_make(lx, K_LPAREN, start, line, col);
+    }
+    if (c == 41) {
+        tk_advance(lx);
+        return tk_make(lx, K_RPAREN, start, line, col);
+    }
+    if (c == 123) {
+        tk_advance(lx);
+        return tk_make(lx, K_LBRACE, start, line, col);
+    }
+    if (c == 125) {
+        tk_advance(lx);
+        return tk_make(lx, K_RBRACE, start, line, col);
+    }
+    if (c == 91) {
+        tk_advance(lx);
+        return tk_make(lx, K_LBRACK, start, line, col);
+    }
+    if (c == 93) {
+        tk_advance(lx);
+        return tk_make(lx, K_RBRACK, start, line, col);
+    }
+    if (c == 59) {
+        tk_advance(lx);
+        return tk_make(lx, K_SEMI, start, line, col);
+    }
+    if (c == 44) {
+        tk_advance(lx);
+        return tk_make(lx, K_COMMA, start, line, col);
+    }
+    if (c == 58) {
+        tk_advance(lx);
+        return tk_make(lx, K_COLON, start, line, col);
+    }
+    if (c == 46) {
+        tk_advance(lx);
+        return tk_make(lx, K_DOT, start, line, col);
+    }
+    if (c == 63) {
+        tk_advance(lx);
+        return tk_make(lx, K_QMARK, start, line, col);
+    }
+    if (c == 61) {
+        tk_advance(lx);
+        return tk_make(lx, K_EQ, start, line, col);
+    }
+    if (c == 33) {
+        tk_advance(lx);
+        return tk_make(lx, K_BANG, start, line, col);
+    }
+    if (c == 126) {
+        tk_advance(lx);
+        return tk_make(lx, K_TILDE, start, line, col);
+    }
+    if (c == 43) {
+        tk_advance(lx);
+        return tk_make(lx, K_PLUS, start, line, col);
+    }
+    if (c == 45) {
+        tk_advance(lx);
+        return tk_make(lx, K_MINUS, start, line, col);
+    }
+    if (c == 42) {
+        tk_advance(lx);
+        return tk_make(lx, K_STAR, start, line, col);
+    }
+    if (c == 47) {
+        tk_advance(lx);
+        return tk_make(lx, K_SLASH, start, line, col);
+    }
+    if (c == 37) {
+        tk_advance(lx);
+        return tk_make(lx, K_PERCENT, start, line, col);
+    }
+    if (c == 60) {
+        tk_advance(lx);
+        return tk_make(lx, K_LT, start, line, col);
+    }
+    if (c == 62) {
+        tk_advance(lx);
+        return tk_make(lx, K_GT, start, line, col);
+    }
+    if (c == 38) {
+        tk_advance(lx);
+        return tk_make(lx, K_AMP, start, line, col);
+    }
+    if (c == 124) {
+        tk_advance(lx);
+        return tk_make(lx, K_PIPE, start, line, col);
+    }
+    if (c == 94) {
+        tk_advance(lx);
+        return tk_make(lx, K_CARET, start, line, col);
+    }
+    tk_advance(lx);
+    return tk_make(lx, K_ERROR, start, line, col);
+}
+
+fn tk_dump(TkTok* t, u8* base) {
+    tk_print_i32(t.kind);
+    tk_print_i32((t.start - base) as i32);
+    tk_print_i32(t.len as i32);
+    tk_print_i32(t.line);
+    tk_print_i32(t.col);
+    return;
+}
+
+fn main() {
+    if (tk_argc() < 2) {
+        return;
+    }
+    char* path = tk_argv(1);
+    u8* mem = tk_malloc(1048576);
+    Arena ar = arena_mk(mem, 1048576);
+    u8* f = tk_fopen(path, "r");
+    if (f == null) {
+        return;
+    }
+    tk_fseek(f, 0, 2);
+    i64 size = tk_ftell(f);
+    tk_fseek(f, 0, 0);
+    u64 n = size as u64;
+    u8* buf = arena_alloc(&ar, n + 8);
+    if (buf == null) {
+        return;
+    }
+    u64 got = tk_fread(buf, 1, n, f);
+    tk_fclose(f);
+    if (got != n) {
+        return;
+    }
+    mut u64 z = 0;
+    while (z < 8) {
+        buf[n + z] = 0;
+        z = z + 1;
+    }
+    TkLex lx = TkLex { src: buf, pos: 0, line: 1, col: 1, };
+    while (true) {
+        TkTok t = tk_next(&lx);
+        tk_dump(&t, buf);
+        if (t.kind == K_EOF) {
+            break;
+        }
+    }
+    tk_free(mem);
+    return;
+}
+// GENERATED by gen_tklex.py from lexer.h + lexer.c -- do not hand-edit.
+// Token-kind ordinals (must match C TokenKind).
+i32 K_IDENT = 0;
+i32 K_WILDCARD = 1;
+i32 K_INT = 2;
+i32 K_FLOAT = 3;
+i32 K_STRING = 4;
+i32 K_CHAR = 5;
+i32 K_FN = 6;
+i32 K_STRUCT = 7;
+i32 K_ENUM = 8;
+i32 K_EFFECT = 9;
+i32 K_HANDLER = 10;
+i32 K_TRAIT = 11;
+i32 K_IMPL = 12;
+i32 K_DYN = 13;
+i32 K_TYPE = 14;
+i32 K_EXTERN = 15;
+i32 K_IMPORT = 16;
+i32 K_MOD = 17;
+i32 K_PUB = 18;
+i32 K_PRIVATE = 19;
+i32 K_CONST = 20;
+i32 K_MUT = 21;
+i32 K_AUTO = 22;
+i32 K_WHERE = 23;
+i32 K_FOR = 24;
+i32 K_IN = 25;
+i32 K_IF = 26;
+i32 K_ELSE = 27;
+i32 K_WHILE = 28;
+i32 K_MATCH = 29;
+i32 K_BREAK = 30;
+i32 K_CONTINUE = 31;
+i32 K_RETURN = 32;
+i32 K_DEFER = 33;
+i32 K_PERFORM = 34;
+i32 K_HANDLE = 35;
+i32 K_WITH = 36;
+i32 K_RESUME = 37;
+i32 K_TRANSACT = 38;
+i32 K_SPAWN = 39;
+i32 K_AS = 40;
+i32 K_SIZEOF = 41;
+i32 K_OFFSETOF = 42;
+i32 K_TRUE = 43;
+i32 K_FALSE = 44;
+i32 K_NULL = 45;
+i32 K_UNDEF = 46;
+i32 K_SELF = 47;
+i32 K_I8 = 48;
+i32 K_I16 = 49;
+i32 K_I32 = 50;
+i32 K_I64 = 51;
+i32 K_U8 = 52;
+i32 K_U16 = 53;
+i32 K_U32 = 54;
+i32 K_U64 = 55;
+i32 K_F32 = 56;
+i32 K_F64 = 57;
+i32 K_CHAR_TY = 58;
+i32 K_BOOL = 59;
+i32 K_SVIEW = 60;
+i32 K_NEVER = 61;
+i32 K_IO = 62;
+i32 K_ALLOC = 63;
+i32 K_READS = 64;
+i32 K_WRITES = 65;
+i32 K_DECIDES = 66;
+i32 K_SUSPENDS = 67;
+i32 K_TRANSACTS = 68;
+i32 K_PURE = 69;
+i32 K_OWNERSHIP = 70;
+i32 K_EFFECT_KW = 71;
+i32 K_LPAREN = 72;
+i32 K_RPAREN = 73;
+i32 K_LBRACE = 74;
+i32 K_RBRACE = 75;
+i32 K_LBRACK = 76;
+i32 K_RBRACK = 77;
+i32 K_SEMI = 78;
+i32 K_COMMA = 79;
+i32 K_COLON = 80;
+i32 K_COLON2 = 81;
+i32 K_DOT = 82;
+i32 K_DOTDOT = 83;
+i32 K_ARROW = 84;
+i32 K_FATARROW = 85;
+i32 K_QMARK = 86;
+i32 K_EQ = 87;
+i32 K_EQEQ = 88;
+i32 K_BANGEQ = 89;
+i32 K_BANG = 90;
+i32 K_TILDE = 91;
+i32 K_PLUS = 92;
+i32 K_MINUS = 93;
+i32 K_STAR = 94;
+i32 K_SLASH = 95;
+i32 K_PERCENT = 96;
+i32 K_LT = 97;
+i32 K_GT = 98;
+i32 K_LTEQ = 99;
+i32 K_GTEQ = 100;
+i32 K_SHL = 101;
+i32 K_SHR = 102;
+i32 K_AMP = 103;
+i32 K_AMP2 = 104;
+i32 K_PIPE = 105;
+i32 K_PIPE2 = 106;
+i32 K_CARET = 107;
+i32 K_PLUS_EQ = 108;
+i32 K_MINUS_EQ = 109;
+i32 K_STAR_EQ = 110;
+i32 K_SLASH_EQ = 111;
+i32 K_PERCENT_EQ = 112;
+i32 K_SHL_EQ = 113;
+i32 K_SHR_EQ = 114;
+i32 K_AMP_EQ = 115;
+i32 K_PIPE_EQ = 116;
+i32 K_CARET_EQ = 117;
+i32 K_PLUSPLUS = 118;
+i32 K_MINUSMINUS = 119;
+i32 K_EOF = 120;
+i32 K_ERROR = 121;
+
+fn tk_lookup_kw(sview w) -> i32 {
+    if (str_eq(w, tk_sview("fn", 2))) { return K_FN; }
+    if (str_eq(w, tk_sview("struct", 6))) { return K_STRUCT; }
+    if (str_eq(w, tk_sview("enum", 4))) { return K_ENUM; }
+    if (str_eq(w, tk_sview("effect", 6))) { return K_EFFECT; }
+    if (str_eq(w, tk_sview("handler", 7))) { return K_HANDLER; }
+    if (str_eq(w, tk_sview("trait", 5))) { return K_TRAIT; }
+    if (str_eq(w, tk_sview("impl", 4))) { return K_IMPL; }
+    if (str_eq(w, tk_sview("dyn", 3))) { return K_DYN; }
+    if (str_eq(w, tk_sview("type", 4))) { return K_TYPE; }
+    if (str_eq(w, tk_sview("extern", 6))) { return K_EXTERN; }
+    if (str_eq(w, tk_sview("import", 6))) { return K_IMPORT; }
+    if (str_eq(w, tk_sview("mod", 3))) { return K_MOD; }
+    if (str_eq(w, tk_sview("pub", 3))) { return K_PUB; }
+    if (str_eq(w, tk_sview("private", 7))) { return K_PRIVATE; }
+    if (str_eq(w, tk_sview("const", 5))) { return K_CONST; }
+    if (str_eq(w, tk_sview("mut", 3))) { return K_MUT; }
+    if (str_eq(w, tk_sview("auto", 4))) { return K_AUTO; }
+    if (str_eq(w, tk_sview("where", 5))) { return K_WHERE; }
+    if (str_eq(w, tk_sview("for", 3))) { return K_FOR; }
+    if (str_eq(w, tk_sview("in", 2))) { return K_IN; }
+    if (str_eq(w, tk_sview("if", 2))) { return K_IF; }
+    if (str_eq(w, tk_sview("else", 4))) { return K_ELSE; }
+    if (str_eq(w, tk_sview("while", 5))) { return K_WHILE; }
+    if (str_eq(w, tk_sview("match", 5))) { return K_MATCH; }
+    if (str_eq(w, tk_sview("break", 5))) { return K_BREAK; }
+    if (str_eq(w, tk_sview("continue", 8))) { return K_CONTINUE; }
+    if (str_eq(w, tk_sview("return", 6))) { return K_RETURN; }
+    if (str_eq(w, tk_sview("defer", 5))) { return K_DEFER; }
+    if (str_eq(w, tk_sview("perform", 7))) { return K_PERFORM; }
+    if (str_eq(w, tk_sview("handle", 6))) { return K_HANDLE; }
+    if (str_eq(w, tk_sview("with", 4))) { return K_WITH; }
+    if (str_eq(w, tk_sview("resume", 6))) { return K_RESUME; }
+    if (str_eq(w, tk_sview("transact", 8))) { return K_TRANSACT; }
+    if (str_eq(w, tk_sview("spawn", 5))) { return K_SPAWN; }
+    if (str_eq(w, tk_sview("as", 2))) { return K_AS; }
+    if (str_eq(w, tk_sview("sizeof", 6))) { return K_SIZEOF; }
+    if (str_eq(w, tk_sview("offsetof", 8))) { return K_OFFSETOF; }
+    if (str_eq(w, tk_sview("true", 4))) { return K_TRUE; }
+    if (str_eq(w, tk_sview("false", 5))) { return K_FALSE; }
+    if (str_eq(w, tk_sview("null", 4))) { return K_NULL; }
+    if (str_eq(w, tk_sview("undef", 5))) { return K_UNDEF; }
+    if (str_eq(w, tk_sview("Self", 4))) { return K_SELF; }
+    if (str_eq(w, tk_sview("i8", 2))) { return K_I8; }
+    if (str_eq(w, tk_sview("i16", 3))) { return K_I16; }
+    if (str_eq(w, tk_sview("i32", 3))) { return K_I32; }
+    if (str_eq(w, tk_sview("i64", 3))) { return K_I64; }
+    if (str_eq(w, tk_sview("u8", 2))) { return K_U8; }
+    if (str_eq(w, tk_sview("u16", 3))) { return K_U16; }
+    if (str_eq(w, tk_sview("u32", 3))) { return K_U32; }
+    if (str_eq(w, tk_sview("u64", 3))) { return K_U64; }
+    if (str_eq(w, tk_sview("f32", 3))) { return K_F32; }
+    if (str_eq(w, tk_sview("f64", 3))) { return K_F64; }
+    if (str_eq(w, tk_sview("char", 4))) { return K_CHAR_TY; }
+    if (str_eq(w, tk_sview("bool", 4))) { return K_BOOL; }
+    if (str_eq(w, tk_sview("sview", 5))) { return K_SVIEW; }
+    if (str_eq(w, tk_sview("never", 5))) { return K_NEVER; }
+    if (str_eq(w, tk_sview("io", 2))) { return K_IO; }
+    if (str_eq(w, tk_sview("alloc", 5))) { return K_ALLOC; }
+    if (str_eq(w, tk_sview("reads", 5))) { return K_READS; }
+    if (str_eq(w, tk_sview("writes", 6))) { return K_WRITES; }
+    if (str_eq(w, tk_sview("decides", 7))) { return K_DECIDES; }
+    if (str_eq(w, tk_sview("suspends", 8))) { return K_SUSPENDS; }
+    if (str_eq(w, tk_sview("transacts", 9))) { return K_TRANSACTS; }
+    if (str_eq(w, tk_sview("pure", 4))) { return K_PURE; }
+    if (str_eq(w, tk_sview("ownership", 9))) { return K_OWNERSHIP; }
+    return K_IDENT;
+}

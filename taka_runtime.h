@@ -27,5 +27,15 @@ static inline uint64_t tk_fread(uint8_t *dst, uint64_t sz, uint64_t n, uint8_t *
 static inline uint64_t tk_fwrite(uint8_t *src, uint64_t sz, uint64_t n, uint8_t *f) { return (uint64_t)fwrite((const void*)src, (size_t)sz, (size_t)n, (FILE*)f); }
 static inline uint64_t tk_strlen(char *s) { return (uint64_t)strlen((const char*)s); }
 static inline bool tk_streq(char *a, char *b) { return strcmp((const char*)a, (const char*)b) == 0; }
+// process args (set by generated main; enables self-hosted CLIs)
+static int tk_g_argc;
+static char **tk_g_argv;
+static inline int32_t tk_argc(void) { return (int32_t)tk_g_argc; }
+static inline char *tk_argv(int32_t i) {
+    if (i < 0 || i >= tk_g_argc) return NULL;
+    return tk_g_argv[i];
+}
+// process spawn for self-hosted build/run (returns wait status like system)
+static inline int32_t tk_system(char *cmd) { return (int32_t)system((const char*)cmd); }
 static inline TkSView tk_sview(char *p, uint64_t n) { TkSView v = {p, (int64_t)n}; return v; }
 static inline TkSView tk_sview_u8(uint8_t *p, uint64_t n) { TkSView v = {(char*)p, (int64_t)n}; return v; }

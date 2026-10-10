@@ -16,6 +16,8 @@ map_test.gen.c
 file_test
 file_test.gen.c
 file_fixture.txt
+args_test
+args_test.gen.c
 m1.gen.c
 m2.gen.c
 m3.gen.c
