@@ -37,5 +37,19 @@ static inline char *tk_argv(int32_t i) {
 }
 // process spawn for self-hosted build/run (returns wait status like system)
 static inline int32_t tk_system(char *cmd) { return (int32_t)system((const char*)cmd); }
+// diagnostics + exit status (self-hosted compilers must report errors)
+static inline void tk_eprint(uint8_t *p, uint64_t n) { fwrite((const void*)p, 1, (size_t)n, stderr); }
+static int32_t tk_g_exit;
+static inline void tk_set_exit(int32_t c) { tk_g_exit = c; }
+static inline uint8_t *tk_stdout(void) { return (uint8_t*)stdout; }
+// Non-inline (emitted standalone): too big for reliable inline expansion,
+// and the native backend calls it through the PLT via this exact symbol.
+// Parses decimal text exactly like strtod; returns the double bits.
+uint64_t tk_strtod_bits(char *s) {
+    double d = strtod((const char*)s, NULL);
+    uint64_t b = 0;
+    memcpy(&b, &d, 8);
+    return b;
+}
 static inline TkSView tk_sview(char *p, uint64_t n) { TkSView v = {p, (int64_t)n}; return v; }
 static inline TkSView tk_sview_u8(uint8_t *p, uint64_t n) { TkSView v = {(char*)p, (int64_t)n}; return v; }

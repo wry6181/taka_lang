@@ -1,0 +1,8 @@
+struct Bad { Bad inner, i32 v, }
+
+extern fn tk_print_i32(i32 x);
+
+fn main() {
+    tk_print_i32(0);
+    return;
+}

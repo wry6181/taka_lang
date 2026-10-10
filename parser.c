@@ -1851,7 +1851,17 @@ int main(int argc, char **argv) {
         ai++;
     }
     int extra_start = 0; // first argv index of run-args (run mode only)
-    if (ai < argc && strcmp(argv[ai], "build") == 0) {
+    if (ai < argc && strcmp(argv[ai], "sexp") == 0) {
+        mode = "sexp";
+        ai++;
+        if (ai >= argc) { usage(argv[0]); return 1; }
+        infile = argv[ai++];
+    } else if (ai < argc && strcmp(argv[ai], "check") == 0) {
+        mode = "check";
+        ai++;
+        if (ai >= argc) { usage(argv[0]); return 1; }
+        infile = argv[ai++];
+    } else if (ai < argc && strcmp(argv[ai], "build") == 0) {
         mode = "build";
         ai++;
         if (ai >= argc) { usage(argv[0]); return 1; }
@@ -1875,7 +1885,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    mem_arena *arena = arena_create(MByte(8));
+    mem_arena *arena = arena_create(MByte(32));
     if (!arena) { fprintf(stderr, "arena_create failed\n"); return 1; }
 
     const char *src = read_file(arena, infile);
@@ -1909,7 +1919,7 @@ int main(int argc, char **argv) {
     char gen_buf[1024];
     int use_c = (strcmp(backend, "c") == 0);
     if (strcmp(mode, "gen") == 0) {
-        if (use_c && ends_with(infile, "mut.tk")) {
+    if (use_c && ends_with(infile, "mut.tk")) {
             Parser p = {toks, n, 0, arena, 0, 0};
             FnDef *fn = parse_program(&p);
             print_fn(fn);
@@ -1929,7 +1939,7 @@ int main(int argc, char **argv) {
         gen_path = gen_buf;
     }
 
-    if (use_c && ends_with(infile, "mut.tk")) {
+    if (use_c && ends_with(infile, "mut.tk") && strcmp(mode, "sexp") != 0 && strcmp(mode, "check") != 0) {
         Parser p = {toks, n, 0, arena, 0, 0};
         FnDef *fn = parse_program(&p);
         gen_c(fn, gen_path);
@@ -1944,11 +1954,26 @@ int main(int argc, char **argv) {
                 arena_destroy(arena);
                 return 0;
             }
+            if (strcmp(mode, "sexp") == 0) {
+                printf("sexp error: %s\n", berr ? berr : "advanced feature");
+                arena_destroy(arena);
+                return 1;
+            }
             fprintf(stderr, "taka: core backend TODO (%s) — cannot build this file\n",
                 berr ? berr : "advanced feature");
             if (have_tmpdir) cleanup_tmpdir(tmpdir, NULL, NULL);
             arena_destroy(arena);
             return 1;
+        }
+        if (strcmp(mode, "sexp") == 0) {
+            dump_sexp(prog);
+            arena_destroy(arena);
+            return 0;
+        }
+        if (strcmp(mode, "check") == 0) {
+            int rc = sema_check(prog, arena);
+            arena_destroy(arena);
+            return rc;
         }
         if (sema_check(prog, arena) != 0) {
             if (have_tmpdir) cleanup_tmpdir(tmpdir, NULL, NULL);

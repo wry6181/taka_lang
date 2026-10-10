@@ -233,11 +233,9 @@ static void emit_expr(TkExpr *e) {
         }
         case TK_EX_FIELD: {
             // one-level auto-deref (grammar 15): base of pointer/ref type uses `->`
-            if (e->callee && e->callee->kind == TK_EX_VAR && e->callee->path.count == 1) {
-                TkType *bt = cg_var_find(e->callee->path.segs[0].seg);
-                if (bt && (bt->stars > 0 || bt->is_ref)) {
-                    emit_expr(e->callee); fprintf(out,"->%s",e->field); break;
-                }
+            TkType *bt = infer_expr_type(e->callee);
+            if (bt && (bt->stars > 0 || bt->is_ref)) {
+                emit_expr(e->callee); fprintf(out,"->%s",e->field); break;
             }
             emit_expr(e->callee);fprintf(out,".%s",e->field); break;
         }
@@ -974,7 +972,7 @@ int cgen_emit(TkProgram *prog, const char *out_path) {
                 it->kind==TK_IT_TRAIT?"trait":it->kind==TK_IT_IMPL?"impl":it->kind==TK_IT_EFFECT?"effect":"handler");
         }
     }
-    fprintf(out,"\nint main(int argc, char **argv){ tk_g_argc = argc; tk_g_argv = argv; taka_main(); return 0; }\n");
+    fprintf(out,"\nint main(int argc, char **argv){ tk_g_argc = argc; tk_g_argv = argv; taka_main(); return tk_g_exit; }\n");
     // main mapping: taka `fn main()` has no args and may return void/i32; wrap.
     fclose(out);
     int rc = cg_failed ? 1 : 0;

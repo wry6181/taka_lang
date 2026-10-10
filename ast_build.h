@@ -7,3 +7,5 @@
 // Advanced features (generics/effects/traits/dyn/lambda/match-expr/etc.)
 // return NULL with error message (backend TODO, transparent).
 TkProgram *ast_build_core(Token *toks, int count, mem_arena *arena, const char **err_out);
+// Canonical S-expression dump of a core AST (stage-2 self-host gate).
+void dump_sexp(TkProgram *prog);

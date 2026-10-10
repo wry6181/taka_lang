@@ -275,6 +275,7 @@ static const char *abi_map(const char *nm) {
     if (!strcmp(nm, "tk_strlen")) return "strlen";
     if (!strcmp(nm, "tk_streq")) return "strcmp";
     if (!strcmp(nm, "tk_system")) return "system";
+    if (!strcmp(nm, "tk_eprint")) return "tk_eprint_rt";
     return nm;
 }
 static int is_print_like(const char *nm) {
@@ -3286,6 +3287,7 @@ int x64_emit(TkProgram *prog, const char *out_path) {
     fprintf(o, "    .data\n");
     fprintf(o, "tk_rt_argc:\n    .long 0\n");
     fprintf(o, "tk_rt_argv:\n    .quad 0\n");
+    fprintf(o, "tk_g_exit:\n    .long 0\n");
     fprintf(o, "    .text\n");
     fprintf(o, "    .globl tk_argc\ntk_argc:\n");
     fprintf(o, "    movl tk_rt_argc(%%rip), %%eax\n    ret\n");
@@ -3296,13 +3298,26 @@ int x64_emit(TkProgram *prog, const char *out_path) {
     fprintf(o, "    movq tk_rt_argv(%%rip), %%rax\n");
     fprintf(o, "    movq (%%rax,%%rcx,8), %%rax\n    ret\n");
     fprintf(o, ".Largv_null:\n    xorl %%eax, %%eax\n    ret\n");
+    // tk_eprint(p, n): write(2, p, n); returns bytes written (i64 in RAX).
+    fprintf(o, "    .globl tk_eprint_rt\ntk_eprint_rt:\n");
+    fprintf(o, "    movq %%rsi, %%rdx\n    movq %%rdi, %%rsi\n    movl $2, %%edi\n");
+    fprintf(o, "    call write@PLT\n    ret\n");
+    // tk_set_exit(c): store process exit code (returned by main).
+    fprintf(o, "    .globl tk_set_exit\ntk_set_exit:\n");
+    fprintf(o, "    movl %%edi, tk_g_exit(%%rip)\n    ret\n");
+    // tk_stdout(): return C stdout FILE* (for block writes via fwrite).
+    fprintf(o, "    .globl tk_stdout\ntk_stdout:\n");
+    fprintf(o, "    movq stdout@GOTPCREL(%%rip), %%rax\n    movq (%%rax), %%rax\n    ret\n");
+    // tk_strtod_bits(s): NUL-terminated decimal -> f64 bits in RAX (via strtod).
+    fprintf(o, "    .globl tk_strtod_bits\ntk_strtod_bits:\n");
+    fprintf(o, "    call strtod@PLT\n    movq %%xmm0, %%rax\n    ret\n");
     fprintf(o, "    .globl main\n");
     fprintf(o, "main:\n");
     fprintf(o, "    pushq %%rbp\n    movq %%rsp, %%rbp\n");
     fprintf(o, "    movl %%edi, tk_rt_argc(%%rip)\n");
     fprintf(o, "    movq %%rsi, tk_rt_argv(%%rip)\n");
     fprintf(o, "    call taka_main\n");
-    fprintf(o, "    xorl %%eax, %%eax\n");
+    fprintf(o, "    movl tk_g_exit(%%rip), %%eax\n");
     fprintf(o, "    leave\n    ret\n");
     // rodata strings (ids assigned during emission; forward refs resolve at asm)
     fprintf(o, "    .section .rodata\n");
@@ -3336,6 +3351,29 @@ int x64_emit(TkProgram *prog, const char *out_path) {
                 int id = rod_add(in->tok.start + 1, (int)in->tok.len - 2);
                 fprintf(o, "%s:\n", it->gdecl->names[k]);
                 fprintf(o, "    .quad .Lstr_%d\n", id);
+            } else if (in->kind == TK_EX_UNARY &&
+                       (in->op == TOKEN_MINUS || in->op == TOKEN_PLUS) &&
+                       in->lhs && in->lhs->kind == TK_EX_INT &&
+                       w != Q_STRUCT && w != Q_F32 && w != Q_F64 && w != Q_VOID) {
+                int cv = 0;
+                if (const_int(in, &cv)) { Xerr("non-constant global initializer TODO in native backend"); }
+                else {
+                    if (!have_data) { fprintf(o, "    .data\n"); have_data = 1; }
+                    fprintf(o, "%s:\n", it->gdecl->names[k]);
+                    u64 bits = (u64)(i64)cv;
+                    if (w == Q_I8 || w == Q_U8 || w == Q_BOOL || w == Q_CHAR)
+                        fprintf(o, "    .byte %u\n", (unsigned)(bits & 0xFF));
+                    else if (w == Q_I16 || w == Q_U16)
+                        fprintf(o, "    .value %u\n", (unsigned)(bits & 0xFFFF));
+                    else if (w == Q_I32 || w == Q_U32)
+                        fprintf(o, "    .long %u\n", (unsigned)(bits & 0xFFFFFFFF));
+                    else
+                        fprintf(o, "    .quad %llu\n", (unsigned long long)bits);
+                }
+            } else if (in->kind == TK_EX_NULL) {
+                if (!have_data) { fprintf(o, "    .data\n"); have_data = 1; }
+                fprintf(o, "%s:\n", it->gdecl->names[k]);
+                fprintf(o, "    .quad 0\n");
             } else {
                 Xerr("non-constant global initializer TODO in native backend");
             }

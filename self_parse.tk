@@ -1,0 +1,4445 @@
+
+struct TkTok { i32 kind, u8* start, u64 len, i32 line, i32 col, }
+struct TkLex { u8* src, u64 pos, i32 line, i32 col, }
+
+fn tk_peek(TkLex* lx) -> u8 {
+    return lx.src[lx.pos];
+}
+
+fn tk_peek2(TkLex* lx) -> u8 {
+    return lx.src[lx.pos + 1];
+}
+
+fn tk_peek3(TkLex* lx) -> u8 {
+    return lx.src[lx.pos + 2];
+}
+
+fn tk_advance(TkLex* lx) -> u8 {
+    u8 c = lx.src[lx.pos];
+    lx.pos = lx.pos + 1;
+    if (c == 10) {
+        lx.line = lx.line + 1;
+        lx.col = 1;
+    } else {
+        lx.col = lx.col + 1;
+    }
+    return c;
+}
+
+fn tk_make(TkLex* lx, i32 kind, u64 start, i32 line, i32 col) -> TkTok {
+    TkTok t = TkTok { kind: kind, start: lx.src + start, len: lx.pos - start, line: line, col: col, };
+    return t;
+}
+
+fn tk_is_alpha(u8 c) -> bool {
+    if (c >= 97 && c <= 122) { return true; }
+    if (c >= 65 && c <= 90) { return true; }
+    return false;
+}
+
+fn tk_is_digit(u8 c) -> bool {
+    if (c >= 48 && c <= 57) { return true; }
+    return false;
+}
+
+fn tk_is_alnum(u8 c) -> bool {
+    if (tk_is_alpha(c)) { return true; }
+    if (tk_is_digit(c)) { return true; }
+    return false;
+}
+
+fn tk_is_hexdig(u8 c) -> bool {
+    if (tk_is_digit(c)) { return true; }
+    if (c >= 97 && c <= 102) { return true; }
+    if (c >= 65 && c <= 70) { return true; }
+    return false;
+}
+
+fn tk_skip(TkLex* lx) {
+    while (true) {
+        u8 c = tk_peek(lx);
+        if (c == 32 || c == 9 || c == 13 || c == 10) {
+            tk_advance(lx);
+        } else if (c == 47 && tk_peek2(lx) == 47) {
+            while (tk_peek(lx) != 0 && tk_peek(lx) != 10) { tk_advance(lx); }
+        } else if (c == 47 && tk_peek2(lx) == 42) {
+            tk_advance(lx);
+            tk_advance(lx);
+            mut i32 depth = 1;
+            while (depth > 0 && tk_peek(lx) != 0) {
+                if (tk_peek(lx) == 47 && tk_peek2(lx) == 42) {
+                    tk_advance(lx);
+                    tk_advance(lx);
+                    depth = depth + 1;
+                } else if (tk_peek(lx) == 42 && tk_peek2(lx) == 47) {
+                    tk_advance(lx);
+                    tk_advance(lx);
+                    depth = depth - 1;
+                } else {
+                    tk_advance(lx);
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    return;
+}
+
+fn tk_match_suffix(TkLex* lx, sview s) -> bool {
+    mut u64 i = 0;
+    while (i < s.len as u64) {
+        if (lx.src[lx.pos + i] != s.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    u8 after = lx.src[lx.pos + i];
+    if (tk_is_alnum(after) || after == 95) {
+        return false;
+    }
+    mut u64 j = 0;
+    while (j < s.len as u64) {
+        tk_advance(lx);
+        j = j + 1;
+    }
+    return true;
+}
+
+fn tk_float_suffix(TkLex* lx) {
+    if (tk_peek(lx) == 102 && tk_peek2(lx) == 51 && tk_peek3(lx) == 50) {
+        u8 a = lx.src[lx.pos + 3];
+        if (!tk_is_alnum(a) && a != 95) {
+            tk_advance(lx);
+            tk_advance(lx);
+            tk_advance(lx);
+        }
+    } else if (tk_peek(lx) == 102 && tk_peek2(lx) == 54 && tk_peek3(lx) == 52) {
+        u8 a = lx.src[lx.pos + 3];
+        if (!tk_is_alnum(a) && a != 95) {
+            tk_advance(lx);
+            tk_advance(lx);
+            tk_advance(lx);
+        }
+    }
+    return;
+}
+
+fn tk_next(TkLex* lx) -> TkTok {
+    tk_skip(lx);
+    u64 start = lx.pos;
+    i32 line = lx.line;
+    i32 col = lx.col;
+    u8 c = tk_peek(lx);
+    if (c == 0) {
+        return tk_make(lx, K_EOF, start, line, col);
+    }
+    if (tk_is_alpha(c) || c == 95) {
+        tk_advance(lx);
+        while (tk_is_alnum(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+        u64 len = lx.pos - start;
+        if (len == 1 && lx.src[start] == 95) {
+            return tk_make(lx, K_WILDCARD, start, line, col);
+        }
+        sview w = tk_sview_u8(lx.src + start, len);
+        i32 k = tk_lookup_kw(w);
+        return tk_make(lx, k, start, line, col);
+    }
+    if (tk_is_digit(c)) {
+        if (c == 48 && (tk_peek2(lx) == 120 || tk_peek2(lx) == 88)) {
+            tk_advance(lx);
+            tk_advance(lx);
+            while (tk_is_hexdig(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+        } else if (c == 48 && (tk_peek2(lx) == 98 || tk_peek2(lx) == 66)) {
+            tk_advance(lx);
+            tk_advance(lx);
+            while (tk_peek(lx) == 48 || tk_peek(lx) == 49 || tk_peek(lx) == 95) { tk_advance(lx); }
+        } else {
+            while (tk_is_digit(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+            if (tk_peek(lx) == 46 && tk_is_digit(tk_peek2(lx))) {
+                tk_advance(lx);
+                while (tk_is_digit(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+                if (tk_peek(lx) == 101 || tk_peek(lx) == 69) {
+                    u64 save = lx.pos;
+                    i32 scol = lx.col;
+                    tk_advance(lx);
+                    if (tk_peek(lx) == 43 || tk_peek(lx) == 45) { tk_advance(lx); }
+                    if (!tk_is_digit(tk_peek(lx))) {
+                        lx.pos = save;
+                        lx.col = scol;
+                    } else {
+                        while (tk_is_digit(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+                    }
+                }
+                tk_float_suffix(lx);
+                return tk_make(lx, K_FLOAT, start, line, col);
+            }
+            if (tk_peek(lx) == 101 || tk_peek(lx) == 69) {
+                u64 save = lx.pos;
+                i32 scol = lx.col;
+                u8 n1 = tk_peek2(lx);
+                u8 n2 = lx.src[lx.pos + 2];
+                mut bool ok = false;
+                if (tk_is_digit(n1)) {
+                    ok = true;
+                } else if ((n1 == 43 || n1 == 45) && tk_is_digit(n2)) {
+                    ok = true;
+                }
+                if (ok) {
+                    tk_advance(lx);
+                    if (tk_peek(lx) == 43 || tk_peek(lx) == 45) { tk_advance(lx); }
+                    while (tk_is_digit(tk_peek(lx)) || tk_peek(lx) == 95) { tk_advance(lx); }
+                    tk_float_suffix(lx);
+                    return tk_make(lx, K_FLOAT, start, line, col);
+                } else {
+                    lx.pos = save;
+                    lx.col = scol;
+                }
+            }
+        }
+        tk_match_suffix(lx, tk_sview("i8", 2));
+        tk_match_suffix(lx, tk_sview("i16", 3));
+        tk_match_suffix(lx, tk_sview("i32", 3));
+        tk_match_suffix(lx, tk_sview("i64", 3));
+        tk_match_suffix(lx, tk_sview("u8", 2));
+        tk_match_suffix(lx, tk_sview("u16", 3));
+        tk_match_suffix(lx, tk_sview("u32", 3));
+        tk_match_suffix(lx, tk_sview("u64", 3));
+        return tk_make(lx, K_INT, start, line, col);
+    }
+    if (c == 34) {
+        tk_advance(lx);
+        while (tk_peek(lx) != 0 && tk_peek(lx) != 34 && tk_peek(lx) != 10) {
+            if (tk_peek(lx) == 92) {
+                tk_advance(lx);
+                if (tk_peek(lx) != 0) { tk_advance(lx); }
+            } else {
+                tk_advance(lx);
+            }
+        }
+        if (tk_peek(lx) == 34) {
+            tk_advance(lx);
+            return tk_make(lx, K_STRING, start, line, col);
+        }
+        return tk_make(lx, K_ERROR, start, line, col);
+    }
+    if (c == 39) {
+        tk_advance(lx);
+        if (tk_peek(lx) == 92) {
+            tk_advance(lx);
+            if (tk_peek(lx) != 0) { tk_advance(lx); }
+        } else if (tk_peek(lx) != 0 && tk_peek(lx) != 39 && tk_peek(lx) != 10) {
+            tk_advance(lx);
+        }
+        if (tk_peek(lx) == 39) {
+            tk_advance(lx);
+            return tk_make(lx, K_CHAR, start, line, col);
+        }
+        return tk_make(lx, K_ERROR, start, line, col);
+    }
+    if (c == 60 && tk_peek2(lx) == 60 && lx.src[lx.pos + 2] == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SHL_EQ, start, line, col);
+    }
+    if (c == 62 && tk_peek2(lx) == 62 && lx.src[lx.pos + 2] == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SHR_EQ, start, line, col);
+    }
+    if (c == 58 && tk_peek2(lx) == 58) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_COLON2, start, line, col);
+    }
+    if (c == 45 && tk_peek2(lx) == 62) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_ARROW, start, line, col);
+    }
+    if (c == 61 && tk_peek2(lx) == 62) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_FATARROW, start, line, col);
+    }
+    if (c == 46 && tk_peek2(lx) == 46) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_DOTDOT, start, line, col);
+    }
+    if (c == 61 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_EQEQ, start, line, col);
+    }
+    if (c == 33 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_BANGEQ, start, line, col);
+    }
+    if (c == 60 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_LTEQ, start, line, col);
+    }
+    if (c == 62 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_GTEQ, start, line, col);
+    }
+    if (c == 60 && tk_peek2(lx) == 60) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SHL, start, line, col);
+    }
+    if (c == 62 && tk_peek2(lx) == 62) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SHR, start, line, col);
+    }
+    if (c == 38 && tk_peek2(lx) == 38) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_AMP2, start, line, col);
+    }
+    if (c == 124 && tk_peek2(lx) == 124) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PIPE2, start, line, col);
+    }
+    if (c == 43 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PLUS_EQ, start, line, col);
+    }
+    if (c == 45 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_MINUS_EQ, start, line, col);
+    }
+    if (c == 42 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_STAR_EQ, start, line, col);
+    }
+    if (c == 47 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_SLASH_EQ, start, line, col);
+    }
+    if (c == 37 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PERCENT_EQ, start, line, col);
+    }
+    if (c == 38 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_AMP_EQ, start, line, col);
+    }
+    if (c == 124 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PIPE_EQ, start, line, col);
+    }
+    if (c == 94 && tk_peek2(lx) == 61) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_CARET_EQ, start, line, col);
+    }
+    if (c == 43 && tk_peek2(lx) == 43) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_PLUSPLUS, start, line, col);
+    }
+    if (c == 45 && tk_peek2(lx) == 45) {
+        tk_advance(lx);
+        tk_advance(lx);
+        return tk_make(lx, K_MINUSMINUS, start, line, col);
+    }
+    if (c == 40) {
+        tk_advance(lx);
+        return tk_make(lx, K_LPAREN, start, line, col);
+    }
+    if (c == 41) {
+        tk_advance(lx);
+        return tk_make(lx, K_RPAREN, start, line, col);
+    }
+    if (c == 123) {
+        tk_advance(lx);
+        return tk_make(lx, K_LBRACE, start, line, col);
+    }
+    if (c == 125) {
+        tk_advance(lx);
+        return tk_make(lx, K_RBRACE, start, line, col);
+    }
+    if (c == 91) {
+        tk_advance(lx);
+        return tk_make(lx, K_LBRACK, start, line, col);
+    }
+    if (c == 93) {
+        tk_advance(lx);
+        return tk_make(lx, K_RBRACK, start, line, col);
+    }
+    if (c == 59) {
+        tk_advance(lx);
+        return tk_make(lx, K_SEMI, start, line, col);
+    }
+    if (c == 44) {
+        tk_advance(lx);
+        return tk_make(lx, K_COMMA, start, line, col);
+    }
+    if (c == 58) {
+        tk_advance(lx);
+        return tk_make(lx, K_COLON, start, line, col);
+    }
+    if (c == 46) {
+        tk_advance(lx);
+        return tk_make(lx, K_DOT, start, line, col);
+    }
+    if (c == 63) {
+        tk_advance(lx);
+        return tk_make(lx, K_QMARK, start, line, col);
+    }
+    if (c == 61) {
+        tk_advance(lx);
+        return tk_make(lx, K_EQ, start, line, col);
+    }
+    if (c == 33) {
+        tk_advance(lx);
+        return tk_make(lx, K_BANG, start, line, col);
+    }
+    if (c == 126) {
+        tk_advance(lx);
+        return tk_make(lx, K_TILDE, start, line, col);
+    }
+    if (c == 43) {
+        tk_advance(lx);
+        return tk_make(lx, K_PLUS, start, line, col);
+    }
+    if (c == 45) {
+        tk_advance(lx);
+        return tk_make(lx, K_MINUS, start, line, col);
+    }
+    if (c == 42) {
+        tk_advance(lx);
+        return tk_make(lx, K_STAR, start, line, col);
+    }
+    if (c == 47) {
+        tk_advance(lx);
+        return tk_make(lx, K_SLASH, start, line, col);
+    }
+    if (c == 37) {
+        tk_advance(lx);
+        return tk_make(lx, K_PERCENT, start, line, col);
+    }
+    if (c == 60) {
+        tk_advance(lx);
+        return tk_make(lx, K_LT, start, line, col);
+    }
+    if (c == 62) {
+        tk_advance(lx);
+        return tk_make(lx, K_GT, start, line, col);
+    }
+    if (c == 38) {
+        tk_advance(lx);
+        return tk_make(lx, K_AMP, start, line, col);
+    }
+    if (c == 124) {
+        tk_advance(lx);
+        return tk_make(lx, K_PIPE, start, line, col);
+    }
+    if (c == 94) {
+        tk_advance(lx);
+        return tk_make(lx, K_CARET, start, line, col);
+    }
+    tk_advance(lx);
+    return tk_make(lx, K_ERROR, start, line, col);
+}
+
+// GENERATED by gen_tklex.py from lexer.h + lexer.c -- do not hand-edit.
+// Token-kind ordinals (must match C TokenKind).
+i32 K_IDENT = 0;
+i32 K_WILDCARD = 1;
+i32 K_INT = 2;
+i32 K_FLOAT = 3;
+i32 K_STRING = 4;
+i32 K_CHAR = 5;
+i32 K_FN = 6;
+i32 K_STRUCT = 7;
+i32 K_ENUM = 8;
+i32 K_EFFECT = 9;
+i32 K_HANDLER = 10;
+i32 K_TRAIT = 11;
+i32 K_IMPL = 12;
+i32 K_DYN = 13;
+i32 K_TYPE = 14;
+i32 K_EXTERN = 15;
+i32 K_IMPORT = 16;
+i32 K_MOD = 17;
+i32 K_PUB = 18;
+i32 K_PRIVATE = 19;
+i32 K_CONST = 20;
+i32 K_MUT = 21;
+i32 K_AUTO = 22;
+i32 K_WHERE = 23;
+i32 K_FOR = 24;
+i32 K_IN = 25;
+i32 K_IF = 26;
+i32 K_ELSE = 27;
+i32 K_WHILE = 28;
+i32 K_MATCH = 29;
+i32 K_BREAK = 30;
+i32 K_CONTINUE = 31;
+i32 K_RETURN = 32;
+i32 K_DEFER = 33;
+i32 K_PERFORM = 34;
+i32 K_HANDLE = 35;
+i32 K_WITH = 36;
+i32 K_RESUME = 37;
+i32 K_TRANSACT = 38;
+i32 K_SPAWN = 39;
+i32 K_AS = 40;
+i32 K_SIZEOF = 41;
+i32 K_OFFSETOF = 42;
+i32 K_TRUE = 43;
+i32 K_FALSE = 44;
+i32 K_NULL = 45;
+i32 K_UNDEF = 46;
+i32 K_SELF = 47;
+i32 K_I8 = 48;
+i32 K_I16 = 49;
+i32 K_I32 = 50;
+i32 K_I64 = 51;
+i32 K_U8 = 52;
+i32 K_U16 = 53;
+i32 K_U32 = 54;
+i32 K_U64 = 55;
+i32 K_F32 = 56;
+i32 K_F64 = 57;
+i32 K_CHAR_TY = 58;
+i32 K_BOOL = 59;
+i32 K_SVIEW = 60;
+i32 K_NEVER = 61;
+i32 K_IO = 62;
+i32 K_ALLOC = 63;
+i32 K_READS = 64;
+i32 K_WRITES = 65;
+i32 K_DECIDES = 66;
+i32 K_SUSPENDS = 67;
+i32 K_TRANSACTS = 68;
+i32 K_PURE = 69;
+i32 K_OWNERSHIP = 70;
+i32 K_EFFECT_KW = 71;
+i32 K_LPAREN = 72;
+i32 K_RPAREN = 73;
+i32 K_LBRACE = 74;
+i32 K_RBRACE = 75;
+i32 K_LBRACK = 76;
+i32 K_RBRACK = 77;
+i32 K_SEMI = 78;
+i32 K_COMMA = 79;
+i32 K_COLON = 80;
+i32 K_COLON2 = 81;
+i32 K_DOT = 82;
+i32 K_DOTDOT = 83;
+i32 K_ARROW = 84;
+i32 K_FATARROW = 85;
+i32 K_QMARK = 86;
+i32 K_EQ = 87;
+i32 K_EQEQ = 88;
+i32 K_BANGEQ = 89;
+i32 K_BANG = 90;
+i32 K_TILDE = 91;
+i32 K_PLUS = 92;
+i32 K_MINUS = 93;
+i32 K_STAR = 94;
+i32 K_SLASH = 95;
+i32 K_PERCENT = 96;
+i32 K_LT = 97;
+i32 K_GT = 98;
+i32 K_LTEQ = 99;
+i32 K_GTEQ = 100;
+i32 K_SHL = 101;
+i32 K_SHR = 102;
+i32 K_AMP = 103;
+i32 K_AMP2 = 104;
+i32 K_PIPE = 105;
+i32 K_PIPE2 = 106;
+i32 K_CARET = 107;
+i32 K_PLUS_EQ = 108;
+i32 K_MINUS_EQ = 109;
+i32 K_STAR_EQ = 110;
+i32 K_SLASH_EQ = 111;
+i32 K_PERCENT_EQ = 112;
+i32 K_SHL_EQ = 113;
+i32 K_SHR_EQ = 114;
+i32 K_AMP_EQ = 115;
+i32 K_PIPE_EQ = 116;
+i32 K_CARET_EQ = 117;
+i32 K_PLUSPLUS = 118;
+i32 K_MINUSMINUS = 119;
+i32 K_EOF = 120;
+i32 K_ERROR = 121;
+
+fn tk_lookup_kw(sview w) -> i32 {
+    if (str_eq(w, tk_sview("fn", 2))) { return K_FN; }
+    if (str_eq(w, tk_sview("struct", 6))) { return K_STRUCT; }
+    if (str_eq(w, tk_sview("enum", 4))) { return K_ENUM; }
+    if (str_eq(w, tk_sview("effect", 6))) { return K_EFFECT; }
+    if (str_eq(w, tk_sview("handler", 7))) { return K_HANDLER; }
+    if (str_eq(w, tk_sview("trait", 5))) { return K_TRAIT; }
+    if (str_eq(w, tk_sview("impl", 4))) { return K_IMPL; }
+    if (str_eq(w, tk_sview("dyn", 3))) { return K_DYN; }
+    if (str_eq(w, tk_sview("type", 4))) { return K_TYPE; }
+    if (str_eq(w, tk_sview("extern", 6))) { return K_EXTERN; }
+    if (str_eq(w, tk_sview("import", 6))) { return K_IMPORT; }
+    if (str_eq(w, tk_sview("mod", 3))) { return K_MOD; }
+    if (str_eq(w, tk_sview("pub", 3))) { return K_PUB; }
+    if (str_eq(w, tk_sview("private", 7))) { return K_PRIVATE; }
+    if (str_eq(w, tk_sview("const", 5))) { return K_CONST; }
+    if (str_eq(w, tk_sview("mut", 3))) { return K_MUT; }
+    if (str_eq(w, tk_sview("auto", 4))) { return K_AUTO; }
+    if (str_eq(w, tk_sview("where", 5))) { return K_WHERE; }
+    if (str_eq(w, tk_sview("for", 3))) { return K_FOR; }
+    if (str_eq(w, tk_sview("in", 2))) { return K_IN; }
+    if (str_eq(w, tk_sview("if", 2))) { return K_IF; }
+    if (str_eq(w, tk_sview("else", 4))) { return K_ELSE; }
+    if (str_eq(w, tk_sview("while", 5))) { return K_WHILE; }
+    if (str_eq(w, tk_sview("match", 5))) { return K_MATCH; }
+    if (str_eq(w, tk_sview("break", 5))) { return K_BREAK; }
+    if (str_eq(w, tk_sview("continue", 8))) { return K_CONTINUE; }
+    if (str_eq(w, tk_sview("return", 6))) { return K_RETURN; }
+    if (str_eq(w, tk_sview("defer", 5))) { return K_DEFER; }
+    if (str_eq(w, tk_sview("perform", 7))) { return K_PERFORM; }
+    if (str_eq(w, tk_sview("handle", 6))) { return K_HANDLE; }
+    if (str_eq(w, tk_sview("with", 4))) { return K_WITH; }
+    if (str_eq(w, tk_sview("resume", 6))) { return K_RESUME; }
+    if (str_eq(w, tk_sview("transact", 8))) { return K_TRANSACT; }
+    if (str_eq(w, tk_sview("spawn", 5))) { return K_SPAWN; }
+    if (str_eq(w, tk_sview("as", 2))) { return K_AS; }
+    if (str_eq(w, tk_sview("sizeof", 6))) { return K_SIZEOF; }
+    if (str_eq(w, tk_sview("offsetof", 8))) { return K_OFFSETOF; }
+    if (str_eq(w, tk_sview("true", 4))) { return K_TRUE; }
+    if (str_eq(w, tk_sview("false", 5))) { return K_FALSE; }
+    if (str_eq(w, tk_sview("null", 4))) { return K_NULL; }
+    if (str_eq(w, tk_sview("undef", 5))) { return K_UNDEF; }
+    if (str_eq(w, tk_sview("Self", 4))) { return K_SELF; }
+    if (str_eq(w, tk_sview("i8", 2))) { return K_I8; }
+    if (str_eq(w, tk_sview("i16", 3))) { return K_I16; }
+    if (str_eq(w, tk_sview("i32", 3))) { return K_I32; }
+    if (str_eq(w, tk_sview("i64", 3))) { return K_I64; }
+    if (str_eq(w, tk_sview("u8", 2))) { return K_U8; }
+    if (str_eq(w, tk_sview("u16", 3))) { return K_U16; }
+    if (str_eq(w, tk_sview("u32", 3))) { return K_U32; }
+    if (str_eq(w, tk_sview("u64", 3))) { return K_U64; }
+    if (str_eq(w, tk_sview("f32", 3))) { return K_F32; }
+    if (str_eq(w, tk_sview("f64", 3))) { return K_F64; }
+    if (str_eq(w, tk_sview("char", 4))) { return K_CHAR_TY; }
+    if (str_eq(w, tk_sview("bool", 4))) { return K_BOOL; }
+    if (str_eq(w, tk_sview("sview", 5))) { return K_SVIEW; }
+    if (str_eq(w, tk_sview("never", 5))) { return K_NEVER; }
+    if (str_eq(w, tk_sview("io", 2))) { return K_IO; }
+    if (str_eq(w, tk_sview("alloc", 5))) { return K_ALLOC; }
+    if (str_eq(w, tk_sview("reads", 5))) { return K_READS; }
+    if (str_eq(w, tk_sview("writes", 6))) { return K_WRITES; }
+    if (str_eq(w, tk_sview("decides", 7))) { return K_DECIDES; }
+    if (str_eq(w, tk_sview("suspends", 8))) { return K_SUSPENDS; }
+    if (str_eq(w, tk_sview("transacts", 9))) { return K_TRANSACTS; }
+    if (str_eq(w, tk_sview("pure", 4))) { return K_PURE; }
+    if (str_eq(w, tk_sview("ownership", 9))) { return K_OWNERSHIP; }
+    return K_IDENT;
+}
+
+// self_parse.tk -- stage 2 of self-hosting: token -> AST builder + sexp dump.
+// The LEXER section below is shared with self_lex.tk (keep in sync until merge).
+// GENERATED blocks (token kinds + keyword table + AST kind consts) are produced
+// by gen_tklex.py (into self_lex.tk) and gen_tkast.py; see build note at oil
+// Assembly: cat parse1.tk tkast_gen.tk kw_gen.tk parse2.tk parse3.tk > self_parse.tk
+
+extern fn tk_print_i32(i32 x);
+extern fn tk_print_str(char* s);
+extern fn tk_malloc(u64 n) -> u8*;
+extern fn tk_free(u8* p);
+extern fn tk_fopen(char* path, char* mode) -> u8*;
+extern fn tk_fclose(u8* f) -> i32;
+extern fn tk_fwrite(u8* src, u64 sz, u64 n, u8* f) -> u64;
+extern fn tk_fseek(u8* f, i64 off, i32 whence) -> i32;
+extern fn tk_ftell(u8* f) -> i64;
+extern fn tk_fread(u8* dst, u64 sz, u64 n, u8* f) -> u64;
+extern fn tk_sview(char* p, u64 n) -> sview;
+extern fn tk_sview_u8(u8* p, u64 n) -> sview;
+extern fn tk_strlen(char* s) -> u64;
+extern fn tk_streq(char* a, char* b) -> bool;
+extern fn tk_argc() -> i32;
+extern fn tk_argv(i32 i) -> char*;
+extern fn tk_eprint(u8* p, u64 n);
+extern fn tk_set_exit(i32 c);
+extern fn tk_stdout() -> u8*;
+
+struct Arena { u8* buf, u64 cap, u64 pos, }
+
+fn arena_mk(u8* buf, u64 cap) -> Arena {
+    Arena a = Arena { buf: buf, cap: cap, pos: 0, };
+    return a;
+}
+
+fn arena_alloc(Arena* a, u64 n) -> u8* {
+    u64 start = (a.pos + 7) / 8 * 8;
+    u64 end = start + n;
+    if (end > a.cap) {
+        return null;
+    }
+    a.pos = end;
+    return a.buf + start;
+}
+
+fn zac(Arena* a, u64 n) -> u8* {
+    u8* m = arena_alloc(a, n);
+    if (m == null) {
+        return null;
+    }
+    mut u64 i = 0;
+    while (i < n) {
+        m[i] = 0;
+        i = i + 1;
+    }
+    return m;
+}
+
+fn str_eq(sview a, sview b) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    mut u64 i = 0;
+    while (i < a.len as u64) {
+        if (a.ptr[i] != b.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn i32_to_str(i32 x, Arena* a) -> sview {
+    u8* buf = arena_alloc(a, 12);
+    bool neg = x < 0;
+    mut u64 n = x as u64;
+    if (neg) {
+        n = (0 - x) as u64;
+    }
+    mut u64 end = 12;
+    if (n == 0) {
+        end = end - 1;
+        buf[end] = 48;
+    }
+    while (n > 0) {
+        u64 d = n % 10;
+        n = n / 10;
+        end = end - 1;
+        buf[end] = (48 + d) as u8;
+    }
+    mut u64 at = end;
+    if (neg) {
+        at = at - 1;
+        buf[at] = 45;
+    }
+    u64 len = 12 - at;
+    sview s = tk_sview_u8(buf + at, len);
+    return s;
+}
+
+// growable vector of 8-byte items (pointers); mirrors BAPPEND.
+struct Vec { u8* buf, u64 len, u64 cap, }
+struct Slot { u8* p, }
+
+fn vec_new() -> Vec* {
+    u8* m = tk_malloc(24);
+    Vec* v = m as Vec*;
+    v.buf = null;
+    v.len = 0;
+    v.cap = 0;
+    return v;
+}
+
+fn vec_push(Vec* v, u8* x) {
+    if (v.len == v.cap) {
+        mut u64 ncap = 8;
+        if (v.cap != 0) {
+            ncap = v.cap + v.cap;
+        }
+        u8* nb = tk_malloc(ncap * 8);
+        mut u64 i = 0;
+        while (i < v.len) {
+            Slot* d = (nb + i * 8) as Slot*;
+            Slot* s = (v.buf + i * 8) as Slot*;
+            d.p = s.p;
+            i = i + 1;
+        }
+        v.buf = nb;
+        v.cap = ncap;
+    }
+    Slot* dst = (v.buf + v.len * 8) as Slot*;
+    dst.p = x;
+    v.len = v.len + 1;
+    return;
+}
+
+fn vec_get(Vec* v, u64 i) -> u8* {
+    Slot* s = (v.buf + i * 8) as Slot*;
+    return s.p;
+}
+
+// GENERATED by gen_tkast.py from ast.h + lexer.c -- do not hand-edit.
+i32 X_EX_INT = 0;
+i32 X_EX_FLOAT = 1;
+i32 X_EX_STRING = 2;
+i32 X_EX_CHAR = 3;
+i32 X_EX_BOOL = 4;
+i32 X_EX_NULL = 5;
+i32 X_EX_UNDEF = 6;
+i32 X_EX_VAR = 7;
+i32 X_EX_PAREN = 8;
+i32 X_EX_STRUCT_LIT = 9;
+i32 X_EX_ARRAY_LIST = 10;
+i32 X_EX_ARRAY_FILL = 11;
+i32 X_EX_BRACE = 12;
+i32 X_EX_LAMBDA = 13;
+i32 X_EX_SIZEOF = 14;
+i32 X_EX_OFFSETOF = 15;
+i32 X_EX_IF = 16;
+i32 X_EX_MATCH = 17;
+i32 X_EX_PERFORM = 18;
+i32 X_EX_HANDLE = 19;
+i32 X_EX_SPAWN = 20;
+i32 X_EX_RESUME = 21;
+i32 X_EX_TRANSACT = 22;
+i32 X_EX_UNARY = 23;
+i32 X_EX_BINARY = 24;
+i32 X_EX_CAST = 25;
+i32 X_EX_TERNARY = 26;
+i32 X_EX_CALL = 27;
+i32 X_EX_INDEX = 28;
+i32 X_EX_FIELD = 29;
+i32 X_EX_POST_INC = 30;
+i32 X_EX_POST_DEC = 31;
+i32 X_EX_BLOCK = 32;
+
+i32 X_ST_DECL = 0;
+i32 X_ST_SIMPLE = 1;
+i32 X_ST_BLOCK = 2;
+i32 X_ST_MATCH_STMT = 3;
+i32 X_ST_HANDLE_STMT = 4;
+i32 X_ST_TRANSACT_STMT = 5;
+i32 X_ST_IF = 6;
+i32 X_ST_WHILE = 7;
+i32 X_ST_FOR_C = 8;
+i32 X_ST_FOR_EACH = 9;
+i32 X_ST_DEFER = 10;
+i32 X_ST_BREAK = 11;
+i32 X_ST_CONTINUE = 12;
+i32 X_ST_RETURN = 13;
+i32 X_ST_LABEL = 14;
+i32 X_ST_SPAWN_BLK = 15;
+i32 X_ST_SPAWN_CALL = 16;
+
+i32 X_PAT_WILD = 0;
+i32 X_PAT_REF = 1;
+i32 X_PAT_LIT = 2;
+i32 X_PAT_BIND = 3;
+i32 X_PAT_PATH = 4;
+
+i32 X_TY_PRIM = 0;
+i32 X_TY_PATH = 1;
+i32 X_TY_FN = 2;
+i32 X_TY_DYN = 3;
+i32 X_TY_TUPLE = 4;
+i32 X_TY_ARRAY = 5;
+i32 X_TY_AUTO = 6;
+
+i32 X_IT_IMPORT = 0;
+i32 X_IT_MOD = 1;
+i32 X_IT_FN = 2;
+i32 X_IT_EXTERN = 3;
+i32 X_IT_STRUCT = 4;
+i32 X_IT_ENUM = 5;
+i32 X_IT_EFFECT = 6;
+i32 X_IT_HANDLER = 7;
+i32 X_IT_TRAIT = 8;
+i32 X_IT_IMPL = 9;
+i32 X_IT_ALIAS = 10;
+i32 X_IT_GLOBAL = 11;
+
+fn tk_kind_name(i32 k) -> sview {
+    if (k == K_IDENT) { return tk_sview("IDENT", 5); }
+    if (k == K_WILDCARD) { return tk_sview("_", 1); }
+    if (k == K_INT) { return tk_sview("INT", 3); }
+    if (k == K_FLOAT) { return tk_sview("FLOAT", 5); }
+    if (k == K_STRING) { return tk_sview("STRING", 6); }
+    if (k == K_CHAR) { return tk_sview("CHAR", 4); }
+    if (k == K_FN) { return tk_sview("fn", 2); }
+    if (k == K_STRUCT) { return tk_sview("struct", 6); }
+    if (k == K_ENUM) { return tk_sview("enum", 4); }
+    if (k == K_EFFECT) { return tk_sview("effect", 6); }
+    if (k == K_HANDLER) { return tk_sview("handler", 7); }
+    if (k == K_TRAIT) { return tk_sview("trait", 5); }
+    if (k == K_IMPL) { return tk_sview("impl", 4); }
+    if (k == K_DYN) { return tk_sview("dyn", 3); }
+    if (k == K_TYPE) { return tk_sview("type", 4); }
+    if (k == K_EXTERN) { return tk_sview("extern", 6); }
+    if (k == K_IMPORT) { return tk_sview("import", 6); }
+    if (k == K_MOD) { return tk_sview("mod", 3); }
+    if (k == K_PUB) { return tk_sview("pub", 3); }
+    if (k == K_PRIVATE) { return tk_sview("private", 7); }
+    if (k == K_CONST) { return tk_sview("const", 5); }
+    if (k == K_MUT) { return tk_sview("mut", 3); }
+    if (k == K_AUTO) { return tk_sview("auto", 4); }
+    if (k == K_WHERE) { return tk_sview("where", 5); }
+    if (k == K_FOR) { return tk_sview("for", 3); }
+    if (k == K_IN) { return tk_sview("in", 2); }
+    if (k == K_IF) { return tk_sview("if", 2); }
+    if (k == K_ELSE) { return tk_sview("else", 4); }
+    if (k == K_WHILE) { return tk_sview("while", 5); }
+    if (k == K_MATCH) { return tk_sview("match", 5); }
+    if (k == K_BREAK) { return tk_sview("break", 5); }
+    if (k == K_CONTINUE) { return tk_sview("continue", 8); }
+    if (k == K_RETURN) { return tk_sview("return", 6); }
+    if (k == K_DEFER) { return tk_sview("defer", 5); }
+    if (k == K_PERFORM) { return tk_sview("perform", 7); }
+    if (k == K_HANDLE) { return tk_sview("handle", 6); }
+    if (k == K_WITH) { return tk_sview("with", 4); }
+    if (k == K_RESUME) { return tk_sview("resume", 6); }
+    if (k == K_TRANSACT) { return tk_sview("transact", 8); }
+    if (k == K_SPAWN) { return tk_sview("spawn", 5); }
+    if (k == K_AS) { return tk_sview("as", 2); }
+    if (k == K_SIZEOF) { return tk_sview("sizeof", 6); }
+    if (k == K_OFFSETOF) { return tk_sview("offsetof", 8); }
+    if (k == K_TRUE) { return tk_sview("true", 4); }
+    if (k == K_FALSE) { return tk_sview("false", 5); }
+    if (k == K_NULL) { return tk_sview("null", 4); }
+    if (k == K_UNDEF) { return tk_sview("undef", 5); }
+    if (k == K_SELF) { return tk_sview("Self", 4); }
+    if (k == K_I8) { return tk_sview("i8", 2); }
+    if (k == K_I16) { return tk_sview("i16", 3); }
+    if (k == K_I32) { return tk_sview("i32", 3); }
+    if (k == K_I64) { return tk_sview("i64", 3); }
+    if (k == K_U8) { return tk_sview("u8", 2); }
+    if (k == K_U16) { return tk_sview("u16", 3); }
+    if (k == K_U32) { return tk_sview("u32", 3); }
+    if (k == K_U64) { return tk_sview("u64", 3); }
+    if (k == K_F32) { return tk_sview("f32", 3); }
+    if (k == K_F64) { return tk_sview("f64", 3); }
+    if (k == K_CHAR_TY) { return tk_sview("char", 4); }
+    if (k == K_BOOL) { return tk_sview("bool", 4); }
+    if (k == K_SVIEW) { return tk_sview("sview", 5); }
+    if (k == K_NEVER) { return tk_sview("never", 5); }
+    if (k == K_IO) { return tk_sview("io", 2); }
+    if (k == K_ALLOC) { return tk_sview("alloc", 5); }
+    if (k == K_READS) { return tk_sview("reads", 5); }
+    if (k == K_WRITES) { return tk_sview("writes", 6); }
+    if (k == K_DECIDES) { return tk_sview("decides", 7); }
+    if (k == K_SUSPENDS) { return tk_sview("suspends", 8); }
+    if (k == K_TRANSACTS) { return tk_sview("transacts", 9); }
+    if (k == K_PURE) { return tk_sview("pure", 4); }
+    if (k == K_OWNERSHIP) { return tk_sview("ownership", 9); }
+    if (k == K_EFFECT_KW) { return tk_sview("effect", 6); }
+    if (k == K_LPAREN) { return tk_sview("(", 1); }
+    if (k == K_RPAREN) { return tk_sview(")", 1); }
+    if (k == K_LBRACE) { return tk_sview("{", 1); }
+    if (k == K_RBRACE) { return tk_sview("}", 1); }
+    if (k == K_LBRACK) { return tk_sview("[", 1); }
+    if (k == K_RBRACK) { return tk_sview("]", 1); }
+    if (k == K_SEMI) { return tk_sview(";", 1); }
+    if (k == K_COMMA) { return tk_sview(",", 1); }
+    if (k == K_COLON) { return tk_sview(":", 1); }
+    if (k == K_COLON2) { return tk_sview("::", 2); }
+    if (k == K_DOT) { return tk_sview(".", 1); }
+    if (k == K_DOTDOT) { return tk_sview("..", 2); }
+    if (k == K_ARROW) { return tk_sview("->", 2); }
+    if (k == K_FATARROW) { return tk_sview("=>", 2); }
+    if (k == K_QMARK) { return tk_sview("?", 1); }
+    if (k == K_EQ) { return tk_sview("=", 1); }
+    if (k == K_EQEQ) { return tk_sview("==", 2); }
+    if (k == K_BANGEQ) { return tk_sview("!=", 2); }
+    if (k == K_BANG) { return tk_sview("!", 1); }
+    if (k == K_TILDE) { return tk_sview("~", 1); }
+    if (k == K_PLUS) { return tk_sview("+", 1); }
+    if (k == K_MINUS) { return tk_sview("-", 1); }
+    if (k == K_STAR) { return tk_sview("*", 1); }
+    if (k == K_SLASH) { return tk_sview("/", 1); }
+    if (k == K_PERCENT) { return tk_sview("%", 1); }
+    if (k == K_LT) { return tk_sview("<", 1); }
+    if (k == K_GT) { return tk_sview(">", 1); }
+    if (k == K_LTEQ) { return tk_sview("<=", 2); }
+    if (k == K_GTEQ) { return tk_sview(">=", 2); }
+    if (k == K_SHL) { return tk_sview("<<", 2); }
+    if (k == K_SHR) { return tk_sview(">>", 2); }
+    if (k == K_AMP) { return tk_sview("&", 1); }
+    if (k == K_AMP2) { return tk_sview("&&", 2); }
+    if (k == K_PIPE) { return tk_sview("|", 1); }
+    if (k == K_PIPE2) { return tk_sview("||", 2); }
+    if (k == K_CARET) { return tk_sview("^", 1); }
+    if (k == K_PLUS_EQ) { return tk_sview("+=", 2); }
+    if (k == K_MINUS_EQ) { return tk_sview("-=", 2); }
+    if (k == K_STAR_EQ) { return tk_sview("*=", 2); }
+    if (k == K_SLASH_EQ) { return tk_sview("/=", 2); }
+    if (k == K_PERCENT_EQ) { return tk_sview("%=", 2); }
+    if (k == K_SHL_EQ) { return tk_sview("<<=", 3); }
+    if (k == K_SHR_EQ) { return tk_sview(">>=", 3); }
+    if (k == K_AMP_EQ) { return tk_sview("&=", 2); }
+    if (k == K_PIPE_EQ) { return tk_sview("|=", 2); }
+    if (k == K_CARET_EQ) { return tk_sview("^=", 2); }
+    if (k == K_PLUSPLUS) { return tk_sview("++", 2); }
+    if (k == K_MINUSMINUS) { return tk_sview("--", 2); }
+    if (k == K_EOF) { return tk_sview("EOF", 3); }
+    if (k == K_ERROR) { return tk_sview("ERROR", 5); }
+    return tk_sview("?", 1);
+}
+
+
+// ---- AST node types (stage 2; only builder-set fields) ----
+struct Expr { i32 kind, TkTok* tok, Vec* path, Expr* lhs, Expr* rhs, Expr* cond, Expr* then_e, Expr* else_e, i32 op, Type* cast_to, Expr* callee, Expr* index, char* field, Vec* args, Vec* sfields, Vec* elems, Expr* scrut, Vec* arms, }
+struct Stmt { i32 kind, bool is_mut, Type* ty, Vec* names, Vec* inits, Expr* e1, Expr* e2, i32 op, bool has_assign, Vec* stmts, Expr* trailing, bool has_trailing, Expr* cond, Expr* cond_ex, Vec* then_s, Expr* then_t, Vec* eifs, Vec* els, Expr* els_t, bool has_els, Stmt* for_init_decl, Stmt* for_init_simple, bool for_init_empty, bool for_init_is_decl, Expr* for_cond, bool has_for_cond, Stmt* for_incr, bool has_incr, Expr* m_scrut, Vec* m_arms, Expr* ret_e, bool has_ret, char* label, }
+struct Pat { i32 kind, TkTok* tok, bool is_mut, char* name, Vec* path, Vec* args, Vec* fields, bool has_dotdot, Vec* or_next, }
+struct Type { i32 kind, bool is_const, i32 stars, bool is_ref, i32 prim, Vec* path, Vec* gargs, }
+struct Item { i32 kind, char* fn_name, Vec* params, Type* ret, bool is_proto, Vec* body, Expr* trail, char* sname, Vec* fields, char* ename, Vec* vars, Stmt* gdecl, }
+struct ArmE { Pat* pat, Expr* guard, Expr* body, }
+struct ArmS { Pat* pat, Expr* guard, Vec* bs, }
+struct SF { char* field, Expr* e, }
+struct FP { char* field, Pat* pat, }
+struct Param { bool is_mut, Type* ty, char* nm, }
+struct SFld { Type* ty, char* nm, }
+struct Variant { char* vn, bool has_tuple, Vec* ts, bool has_struct, Vec* fs, bool has_disc, Expr* disc, }
+struct EIF { Expr* c, Expr* e, Vec* s, Expr* t, }
+struct BlkOut { Vec* ss, Expr* t, }
+struct TkB { u8* toks, u64 count, u64 pos, Arena arena, i32 pend_gt, }
+
+mut u64 g_berr = 0;
+
+fn vpush(Vec* v, u8* x) -> Vec* {
+    mut Vec* w = v;
+    if (w == null) {
+        w = vec_new();
+    }
+    vec_push(w, x);
+    return w;
+}
+
+fn vlen(Vec* v) -> u64 {
+    if (v == null) {
+        return 0;
+    }
+    return v.len;
+}
+
+fn new_expr(TkB* b, i32 kind) -> Expr* {
+    u8* m = zac(&b.arena, 160);
+    if (m == null) {
+        return null;
+    }
+    Expr* e = m as Expr*;
+    e.kind = kind;
+    return e;
+}
+
+fn new_stmt(TkB* b, i32 kind) -> Stmt* {
+    u8* m = zac(&b.arena, 272);
+    if (m == null) {
+        return null;
+    }
+    Stmt* s = m as Stmt*;
+    s.kind = kind;
+    return s;
+}
+
+fn new_pat(TkB* b, i32 kind) -> Pat* {
+    u8* m = zac(&b.arena, 80);
+    if (m == null) {
+        return null;
+    }
+    Pat* p = m as Pat*;
+    p.kind = kind;
+    return p;
+}
+
+fn new_type(TkB* b) -> Type* {
+    u8* m = zac(&b.arena, 64);
+    if (m == null) {
+        return null;
+    }
+    Type* t = m as Type*;
+    return t;
+}
+
+fn tok_at(TkB* b, u64 i) -> TkTok* {
+    return (b.toks + i * 32) as TkTok*;
+}
+
+fn b_pk(TkB* b) -> i32 {
+    if (b.pend_gt > 0) {
+        return K_GT;
+    }
+    TkTok* t = tok_at(b, b.pos);
+    return t.kind;
+}
+
+fn b_match(TkB* b, i32 k) -> bool {
+    if (b_pk(b) == k) {
+        b.pos = b.pos + 1;
+        return true;
+    }
+    return false;
+}
+
+fn b_match_gt(TkB* b) -> bool {
+    if (b.pend_gt > 0) {
+        b.pend_gt = b.pend_gt - 1;
+        return true;
+    }
+    TkTok* t = tok_at(b, b.pos);
+    if (t.kind == K_GT) {
+        b.pos = b.pos + 1;
+        return true;
+    }
+    if (t.kind == K_SHR) {
+        b.pos = b.pos + 1;
+        b.pend_gt = 1;
+        return true;
+    }
+    return false;
+}
+
+fn exp_msg(TkB* b, char* w, i32 line, i32 col) -> char* {
+    sview ls = i32_to_str(line, &b.arena);
+    sview cs = i32_to_str(col, &b.arena);
+    u64 wl = tk_strlen(w);
+    u64 n = 9 + wl + 4 + ls.len as u64 + 1 + cs.len as u64 + 1;
+    u8* m = arena_alloc(&b.arena, n);
+    if (m == null) {
+        return "oom";
+    }
+    sview p0 = tk_sview("expected ", 9);
+    sview p1 = tk_sview(" at ", 4);
+    mut u64 o = 0;
+    mut u64 i = 0;
+    while (i < 9) {
+        m[o] = p0.ptr[i];
+        o = o + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < wl) {
+        m[o] = w[i];
+        o = o + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < 4) {
+        m[o] = p1.ptr[i];
+        o = o + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while (i < ls.len as u64) {
+        m[o] = ls.ptr[i];
+        o = o + 1;
+        i = i + 1;
+    }
+    m[o] = 58;
+    o = o + 1;
+    i = 0;
+    while (i < cs.len as u64) {
+        m[o] = cs.ptr[i];
+        o = o + 1;
+        i = i + 1;
+    }
+    m[o] = 0;
+    return m as char*;
+}
+
+fn b_expect(TkB* b, i32 k, char* w) -> TkTok* {
+    if (!b_match(b, k)) {
+        TkTok* t = tok_at(b, b.pos);
+        g_berr = exp_msg(b, w, t.line, t.col) as u64;
+        return null;
+    }
+    return tok_at(b, b.pos - 1);
+}
+
+fn b_tokstr(TkB* b, TkTok* t) -> char* {
+    u8* m = arena_alloc(&b.arena, t.len + 1);
+    if (m == null) {
+        return "oom";
+    }
+    mut u64 i = 0;
+    while (i < t.len) {
+        m[i] = t.start[i];
+        i = i + 1;
+    }
+    m[t.len] = 0;
+    return m as char*;
+}
+
+fn b_is_prim(i32 k) -> bool {
+    if (k == K_I8 || k == K_I16 || k == K_I32 || k == K_I64) { return true; }
+    if (k == K_U8 || k == K_U16 || k == K_U32 || k == K_U64) { return true; }
+    if (k == K_F32 || k == K_F64 || k == K_CHAR_TY || k == K_BOOL) { return true; }
+    if (k == K_SVIEW || k == K_NEVER) { return true; }
+    return false;
+}
+
+fn b_is_assign(i32 k) -> bool {
+    if (k == K_EQ || k == K_PLUS_EQ || k == K_MINUS_EQ || k == K_STAR_EQ) { return true; }
+    if (k == K_SLASH_EQ || k == K_PERCENT_EQ || k == K_SHL_EQ || k == K_SHR_EQ) { return true; }
+    if (k == K_AMP_EQ || k == K_PIPE_EQ || k == K_CARET_EQ) { return true; }
+    return false;
+}
+
+fn b_prec(i32 k) -> i32 {
+    if (k == K_STAR || k == K_SLASH || k == K_PERCENT) { return 70; }
+    if (k == K_PLUS || k == K_MINUS) { return 60; }
+    if (k == K_SHL || k == K_SHR) { return 50; }
+    if (k == K_AMP) { return 40; }
+    if (k == K_CARET) { return 30; }
+    if (k == K_PIPE) { return 20; }
+    if (k == K_EQEQ || k == K_BANGEQ || k == K_LT || k == K_GT || k == K_LTEQ || k == K_GTEQ) { return 15; }
+    if (k == K_AMP2) { return 10; }
+    if (k == K_PIPE2) { return 5; }
+    return -1;
+}
+
+fn b_type(TkB* b) -> Type* {
+    Type* t = new_type(b);
+    if (t == null) {
+        return null;
+    }
+    if (b_match(b, K_CONST)) {
+        t.is_const = true;
+    }
+    i32 k = b_pk(b);
+    if (k == K_AUTO) {
+        b.pos = b.pos + 1;
+        t.kind = X_TY_AUTO;
+    } else if (b_is_prim(k)) {
+        b.pos = b.pos + 1;
+        t.kind = X_TY_PRIM;
+        t.prim = k;
+    } else if (k == K_IDENT || k == K_SELF) {
+        t.kind = X_TY_PATH;
+        TkTok* t0 = tok_at(b, b.pos);
+        t.path = vpush(t.path, b_tokstr(b, t0) as u8*);
+        b.pos = b.pos + 1;
+        while (b_match(b, K_COLON2)) {
+            TkTok* s = b_expect(b, K_IDENT, "path seg");
+            if (s == null) {
+                return null;
+            }
+            t.path = vpush(t.path, b_tokstr(b, s) as u8*);
+            if (g_berr != 0) {
+                return null;
+            }
+        }
+        if (b_pk(b) == K_LT) {
+            if (!(vlen(t.path) == 1 && tk_streq((vec_get(t.path, 0) as char*), "List"))) {
+                g_berr = "only List<T> generics supported in core builder (validation OK)" as u64;
+                return null;
+            }
+            b.pos = b.pos + 1;
+            Type* elem = b_type(b);
+            if (elem == null || g_berr != 0) {
+                return null;
+            }
+            if (b_match(b, K_COMMA)) {
+                g_berr = "List takes exactly one type arg" as u64;
+                return null;
+            }
+            if (!b_match_gt(b)) {
+                g_berr = "expected '>' for List<T>" as u64;
+                return null;
+            }
+            t.gargs = vpush(t.gargs, elem as u8*);
+        }
+    } else {
+        g_berr = "expected type" as u64;
+        return null;
+    }
+    while (b_match(b, K_STAR)) {
+        t.stars = t.stars + 1;
+    }
+    if (b_match(b, K_AMP)) {
+        t.is_ref = true;
+    }
+    return t;
+}
+
+
+fn b_primary(TkB* b) -> Expr* {
+    i32 k = b_pk(b);
+    if (k == K_MATCH) {
+        b.pos = b.pos + 1;
+        mut Expr* scr = null;
+        if (b_match(b, K_LPAREN)) {
+            scr = b_expr(b);
+            if (scr == null || g_berr != 0) {
+                return null;
+            }
+            if (b_expect(b, K_RPAREN, "')'") == null) {
+                return null;
+            }
+        } else {
+            scr = b_expr(b);
+            if (scr == null || g_berr != 0) {
+                return null;
+            }
+        }
+        if (b_expect(b, K_LBRACE, "'{'") == null) {
+            return null;
+        }
+        Expr* m = new_expr(b, X_EX_MATCH);
+        if (m == null) {
+            return null;
+        }
+        m.scrut = scr;
+        if (b_pk(b) != K_RBRACE) {
+            while (true) {
+                Pat* pat = b_pattern(b);
+                if (pat == null || g_berr != 0) {
+                    return null;
+                }
+                mut Expr* guard = null;
+                if (b_pk(b) == K_IF) {
+                    b.pos = b.pos + 1;
+                    guard = b_expr(b);
+                    if (guard == null || g_berr != 0) {
+                        return null;
+                    }
+                }
+                if (b_expect(b, K_FATARROW, "'=>'") == null) {
+                    return null;
+                }
+                if (b_pk(b) == K_LBRACE) {
+                    g_berr = "block arms need a match statement (=> {...}); match expressions take expr arms" as u64;
+                    return null;
+                }
+                Expr* body = b_expr(b);
+                if (body == null || g_berr != 0) {
+                    return null;
+                }
+                u8* am = zac(&b.arena, 24);
+                if (am == null) {
+                    return null;
+                }
+                ArmE* arm = am as ArmE*;
+                arm.pat = pat;
+                arm.guard = guard;
+                arm.body = body;
+                m.arms = vpush(m.arms, arm as u8*);
+                if (g_berr != 0) {
+                    return null;
+                }
+                if (!b_match(b, K_COMMA)) {
+                    break;
+                }
+                if (b_pk(b) == K_RBRACE) {
+                    break;
+                }
+            }
+        }
+        if (b_expect(b, K_RBRACE, "'}'") == null) {
+            return null;
+        }
+        return m;
+    }
+    if (k == K_INT) {
+        Expr* e = new_expr(b, X_EX_INT);
+        if (e == null) {
+            return null;
+        }
+        e.tok = tok_at(b, b.pos);
+        b.pos = b.pos + 1;
+        return e;
+    }
+    if (k == K_FLOAT) {
+        Expr* e = new_expr(b, X_EX_FLOAT);
+        if (e == null) {
+            return null;
+        }
+        e.tok = tok_at(b, b.pos);
+        b.pos = b.pos + 1;
+        return e;
+    }
+    if (k == K_STRING) {
+        Expr* e = new_expr(b, X_EX_STRING);
+        if (e == null) {
+            return null;
+        }
+        e.tok = tok_at(b, b.pos);
+        b.pos = b.pos + 1;
+        return e;
+    }
+    if (k == K_CHAR) {
+        Expr* e = new_expr(b, X_EX_CHAR);
+        if (e == null) {
+            return null;
+        }
+        e.tok = tok_at(b, b.pos);
+        b.pos = b.pos + 1;
+        return e;
+    }
+    if (k == K_TRUE || k == K_FALSE) {
+        Expr* e = new_expr(b, X_EX_BOOL);
+        if (e == null) {
+            return null;
+        }
+        e.tok = tok_at(b, b.pos);
+        b.pos = b.pos + 1;
+        return e;
+    }
+    if (k == K_NULL) {
+        Expr* e = new_expr(b, X_EX_NULL);
+        if (e == null) {
+            return null;
+        }
+        b.pos = b.pos + 1;
+        return e;
+    }
+    if (k == K_LBRACK) {
+        b.pos = b.pos + 1;
+        Expr* e = new_expr(b, X_EX_ARRAY_LIST);
+        if (e == null) {
+            return null;
+        }
+        if (b_pk(b) != K_RBRACK) {
+            while (true) {
+                Expr* a = b_expr(b);
+                if (a == null || g_berr != 0) {
+                    return null;
+                }
+                if (b_match(b, K_SEMI)) {
+                    g_berr = "array-fill [x; N] TODO in core (use [a, b, ...])" as u64;
+                    return null;
+                }
+                e.elems = vpush(e.elems, a as u8*);
+                if (g_berr != 0) {
+                    return null;
+                }
+                if (!b_match(b, K_COMMA)) {
+                    break;
+                }
+                if (b_pk(b) == K_RBRACK) {
+                    break;
+                }
+            }
+        }
+        if (b_expect(b, K_RBRACK, "']'") == null) {
+            return null;
+        }
+        return e;
+    }
+    if (k == K_LPAREN) {
+        b.pos = b.pos + 1;
+        Expr* e = b_expr(b);
+        if (e == null) {
+            return null;
+        }
+        if (b_expect(b, K_RPAREN, "')'") == null) {
+            return null;
+        }
+        Expr* p = new_expr(b, X_EX_PAREN);
+        if (p == null) {
+            return null;
+        }
+        p.lhs = e;
+        return p;
+    }
+    if (k == K_IDENT || k == K_SELF) {
+        TkTok* t0 = tok_at(b, b.pos);
+        mut Vec* segs = null;
+        segs = vpush(segs, b_tokstr(b, t0) as u8*);
+        b.pos = b.pos + 1;
+        while (b_match(b, K_COLON2)) {
+            TkTok* s = b_expect(b, K_IDENT, "path seg");
+            if (s == null) {
+                return null;
+            }
+            segs = vpush(segs, b_tokstr(b, s) as u8*);
+        }
+        if (b_pk(b) == K_LBRACE) {
+            u64 save = b.pos;
+            b.pos = b.pos + 1;
+            mut bool is_lit = false;
+            if (b_pk(b) == K_RBRACE) {
+                is_lit = true;
+            } else if (b_pk(b) == K_IDENT && tok_at(b, b.pos + 1).kind == K_COLON) {
+                is_lit = true;
+            }
+            b.pos = save;
+            if (is_lit) {
+                Expr* e = new_expr(b, X_EX_STRUCT_LIT);
+                if (e == null) {
+                    return null;
+                }
+                e.path = segs;
+                b.pos = b.pos + 1;
+                if (b_pk(b) != K_RBRACE) {
+                    while (true) {
+                        TkTok* fld = b_expect(b, K_IDENT, "field");
+                        if (fld == null) {
+                            return null;
+                        }
+                        if (b_expect(b, K_COLON, "':'") == null) {
+                            return null;
+                        }
+                        Expr* fe = b_expr(b);
+                        if (fe == null) {
+                            return null;
+                        }
+                        u8* sm = zac(&b.arena, 16);
+                        if (sm == null) {
+                            return null;
+                        }
+                        SF* sf = sm as SF*;
+                        sf.field = b_tokstr(b, fld);
+                        sf.e = fe;
+                        e.sfields = vpush(e.sfields, sf as u8*);
+                        if (g_berr != 0) {
+                            return null;
+                        }
+                        if (!b_match(b, K_COMMA)) {
+                            break;
+                        }
+                        if (b_pk(b) == K_RBRACE) {
+                            break;
+                        }
+                    }
+                }
+                if (b_expect(b, K_RBRACE, "'}'") == null) {
+                    return null;
+                }
+                return e;
+            }
+        }
+        Expr* e = new_expr(b, X_EX_VAR);
+        if (e == null) {
+            return null;
+        }
+        e.path = segs;
+        return e;
+    }
+    g_berr = "expected expression" as u64;
+    return null;
+}
+
+fn b_postfix(TkB* b) -> Expr* {
+    mut Expr* e = b_primary(b);
+    if (e == null) {
+        return null;
+    }
+    while (true) {
+        if (b_match(b, K_LPAREN)) {
+            Expr* c = new_expr(b, X_EX_CALL);
+            if (c == null) {
+                return null;
+            }
+            c.callee = e;
+            if (b_pk(b) != K_RPAREN) {
+                while (true) {
+                    Expr* a = b_expr(b);
+                    if (a == null) {
+                        return null;
+                    }
+                    c.args = vpush(c.args, a as u8*);
+                    if (g_berr != 0) {
+                        return null;
+                    }
+                    if (!b_match(b, K_COMMA)) {
+                        break;
+                    }
+                    if (b_pk(b) == K_RPAREN) {
+                        break;
+                    }
+                }
+            }
+            if (b_expect(b, K_RPAREN, "')'") == null) {
+                return null;
+            }
+            e = c;
+        } else if (b_match(b, K_LBRACK)) {
+            Expr* ix = b_expr(b);
+            if (ix == null) {
+                return null;
+            }
+            if (b_expect(b, K_RBRACK, "']'") == null) {
+                return null;
+            }
+            Expr* n = new_expr(b, X_EX_INDEX);
+            if (n == null) {
+                return null;
+            }
+            n.callee = e;
+            n.index = ix;
+            e = n;
+        } else if (b_match(b, K_DOT)) {
+            TkTok* f = b_expect(b, K_IDENT, "field");
+            if (f == null) {
+                return null;
+            }
+            Expr* n = new_expr(b, X_EX_FIELD);
+            if (n == null) {
+                return null;
+            }
+            n.callee = e;
+            n.field = b_tokstr(b, f);
+            e = n;
+        } else if (b_match(b, K_PLUSPLUS)) {
+            Expr* n = new_expr(b, X_EX_POST_INC);
+            if (n == null) {
+                return null;
+            }
+            n.lhs = e;
+            e = n;
+        } else if (b_match(b, K_MINUSMINUS)) {
+            Expr* n = new_expr(b, X_EX_POST_DEC);
+            if (n == null) {
+                return null;
+            }
+            n.lhs = e;
+            e = n;
+        } else {
+            break;
+        }
+    }
+    return e;
+}
+
+fn b_unary(TkB* b) -> Expr* {
+    i32 k = b_pk(b);
+    if (k == K_PLUS || k == K_MINUS || k == K_BANG || k == K_TILDE || k == K_STAR || k == K_AMP || k == K_PLUSPLUS || k == K_MINUSMINUS) {
+        b.pos = b.pos + 1;
+        Expr* e = new_expr(b, X_EX_UNARY);
+        if (e == null) {
+            return null;
+        }
+        e.op = k;
+        e.lhs = b_unary(b);
+        if (e.lhs == null) {
+            return null;
+        }
+        return e;
+    }
+    if (k == K_AMP2) {
+        g_berr = "'&&' prefix not in core builder" as u64;
+        return null;
+    }
+    return b_postfix(b);
+}
+
+fn b_cast(TkB* b) -> Expr* {
+    mut Expr* e = b_unary(b);
+    if (e == null) {
+        return null;
+    }
+    while (b_match(b, K_AS)) {
+        Type* t = b_type(b);
+        if (t == null) {
+            return null;
+        }
+        Expr* n = new_expr(b, X_EX_CAST);
+        if (n == null) {
+            return null;
+        }
+        n.lhs = e;
+        n.cast_to = t;
+        e = n;
+    }
+    return e;
+}
+
+fn b_bin(TkB* b, i32 mp) -> Expr* {
+    mut Expr* e = b_cast(b);
+    if (e == null) {
+        return null;
+    }
+    while (true) {
+        i32 k = b_pk(b);
+        i32 p = b_prec(k);
+        if (p < mp) {
+            break;
+        }
+        b.pos = b.pos + 1;
+        Expr* r = b_bin(b, p + 1);
+        if (r == null) {
+            return null;
+        }
+        Expr* n = new_expr(b, X_EX_BINARY);
+        if (n == null) {
+            return null;
+        }
+        n.op = k;
+        n.lhs = e;
+        n.rhs = r;
+        e = n;
+    }
+    return e;
+}
+
+fn b_expr(TkB* b) -> Expr* {
+    mut Expr* e = b_bin(b, 0);
+    if (e == null) {
+        return null;
+    }
+    if (b_match(b, K_QMARK)) {
+        Expr* t = b_expr(b);
+        if (t == null) {
+            return null;
+        }
+        if (b_expect(b, K_COLON, "':'") == null) {
+            return null;
+        }
+        Expr* f = b_expr(b);
+        if (f == null) {
+            return null;
+        }
+        Expr* n = new_expr(b, X_EX_TERNARY);
+        if (n == null) {
+            return null;
+        }
+        n.cond = e;
+        n.then_e = t;
+        n.else_e = f;
+        e = n;
+    }
+    return e;
+}
+
+
+fn b_pattern(TkB* b) -> Pat* {
+    Pat* p = b_pat_primary(b);
+    if (p == null || g_berr != 0) {
+        return null;
+    }
+    if (b_pk(b) != K_PIPE) {
+        return p;
+    }
+    mut Vec* extra = null;
+    while (b_match(b, K_PIPE)) {
+        Pat* q = b_pat_primary(b);
+        if (q == null || g_berr != 0) {
+            return null;
+        }
+        extra = vpush(extra, q as u8*);
+        if (g_berr != 0) {
+            return null;
+        }
+    }
+    p.or_next = extra;
+    return p;
+}
+
+fn b_pat_primary(TkB* b) -> Pat* {
+    i32 k = b_pk(b);
+    if (k == K_WILDCARD) {
+        b.pos = b.pos + 1;
+        return new_pat(b, X_PAT_WILD);
+    }
+    if (k == K_AMP) {
+        b.pos = b.pos + 1;
+        TkTok* nm = b_expect(b, K_IDENT, "name after &");
+        if (nm == null) {
+            return null;
+        }
+        Pat* p = new_pat(b, X_PAT_REF);
+        if (p == null) {
+            return null;
+        }
+        p.name = b_tokstr(b, nm);
+        return p;
+    }
+    if (k == K_INT || k == K_FLOAT || k == K_STRING || k == K_CHAR || k == K_TRUE || k == K_FALSE || k == K_NULL || k == K_UNDEF) {
+        Pat* p = new_pat(b, X_PAT_LIT);
+        if (p == null) {
+            return null;
+        }
+        p.tok = tok_at(b, b.pos);
+        b.pos = b.pos + 1;
+        return p;
+    }
+    if (k == K_MUT) {
+        b.pos = b.pos + 1;
+        TkTok* nm = b_expect(b, K_IDENT, "name after mut");
+        if (nm == null) {
+            return null;
+        }
+        if (b_pk(b) == K_COLON2 || b_pk(b) == K_LPAREN || b_pk(b) == K_LBRACE) {
+            g_berr = "'mut' only on plain bindings" as u64;
+            return null;
+        }
+        Pat* p = new_pat(b, X_PAT_BIND);
+        if (p == null) {
+            return null;
+        }
+        p.is_mut = true;
+        p.name = b_tokstr(b, nm);
+        return p;
+    }
+    if (k == K_IDENT || k == K_SELF) {
+        u64 save = b.pos;
+        b.pos = b.pos + 1;
+        mut bool is_path = false;
+        if (b_pk(b) == K_COLON2) {
+            is_path = true;
+        } else if (b_pk(b) == K_LPAREN || b_pk(b) == K_LBRACE) {
+            is_path = true;
+        } else {
+            mut u64 i = b.pos;
+            while (i < b.count && tok_at(b, i).kind == K_COLON2 && i + 1 < b.count && (tok_at(b, i + 1).kind == K_IDENT || tok_at(b, i + 1).kind == K_SELF)) {
+                i = i + 2;
+            }
+            if (i != b.pos) {
+                is_path = true;
+            } else if (i < b.count && (tok_at(b, i).kind == K_LPAREN || tok_at(b, i).kind == K_LBRACE)) {
+                is_path = true;
+            }
+        }
+        b.pos = save;
+        if (!is_path) {
+            TkTok* nm = tok_at(b, b.pos);
+            b.pos = b.pos + 1;
+            Pat* p = new_pat(b, X_PAT_BIND);
+            if (p == null) {
+                return null;
+            }
+            p.is_mut = false;
+            p.name = b_tokstr(b, nm);
+            return p;
+        }
+        Pat* p = new_pat(b, X_PAT_PATH);
+        if (p == null) {
+            return null;
+        }
+        TkTok* t0 = tok_at(b, b.pos);
+        p.path = vpush(p.path, b_tokstr(b, t0) as u8*);
+        b.pos = b.pos + 1;
+        while (b_match(b, K_COLON2)) {
+            TkTok* s = b_expect(b, K_IDENT, "path seg");
+            if (s == null) {
+                return null;
+            }
+            p.path = vpush(p.path, b_tokstr(b, s) as u8*);
+        }
+        if (b_match(b, K_LPAREN)) {
+            if (b_pk(b) != K_RPAREN) {
+                while (true) {
+                    Pat* q = b_pattern(b);
+                    if (q == null || g_berr != 0) {
+                        return null;
+                    }
+                    p.args = vpush(p.args, q as u8*);
+                    if (g_berr != 0) {
+                        return null;
+                    }
+                    if (!b_match(b, K_COMMA)) {
+                        break;
+                    }
+                    if (b_pk(b) == K_RPAREN) {
+                        break;
+                    }
+                }
+            }
+            if (b_expect(b, K_RPAREN, "')'") == null) {
+                return null;
+            }
+        } else if (b_match(b, K_LBRACE)) {
+            if (b_pk(b) != K_RBRACE) {
+                while (true) {
+                    if (b_match(b, K_DOTDOT)) {
+                        p.has_dotdot = true;
+                        b_match(b, K_COMMA);
+                        break;
+                    }
+                    TkTok* fld = b_expect(b, K_IDENT, "field");
+                    if (fld == null) {
+                        return null;
+                    }
+                    mut Pat* sub = null;
+                    if (b_match(b, K_COLON)) {
+                        sub = b_pattern(b);
+                        if (sub == null || g_berr != 0) {
+                            return null;
+                        }
+                    } else {
+                        sub = new_pat(b, X_PAT_BIND);
+                        if (sub == null) {
+                            return null;
+                        }
+                        sub.is_mut = false;
+                        sub.name = b_tokstr(b, fld);
+                    }
+                    u8* fm = zac(&b.arena, 16);
+                    if (fm == null) {
+                        return null;
+                    }
+                    FP* fp = fm as FP*;
+                    fp.field = b_tokstr(b, fld);
+                    fp.pat = sub;
+                    p.fields = vpush(p.fields, fp as u8*);
+                    if (g_berr != 0) {
+                        return null;
+                    }
+                    if (!b_match(b, K_COMMA)) {
+                        break;
+                    }
+                    if (b_pk(b) == K_RBRACE) {
+                        break;
+                    }
+                }
+            }
+            if (b_expect(b, K_RBRACE, "'}'") == null) {
+                return null;
+            }
+        }
+        return p;
+    }
+    g_berr = "expected pattern" as u64;
+    return null;
+}
+
+fn b_block_body(TkB* b, BlkOut* o) {
+    o.ss = null;
+    o.t = null;
+    while (b_pk(b) != K_RBRACE && b_pk(b) != K_EOF) {
+        Stmt* s = b_stmt(b);
+        if (s == null || g_berr != 0) {
+            return;
+        }
+        o.ss = vpush(o.ss, s as u8*);
+        if (g_berr != 0) {
+            return;
+        }
+    }
+    return;
+}
+
+fn b_stmt(TkB* b) -> Stmt* {
+    i32 k = b_pk(b);
+    if (k == K_LBRACE) {
+        b.pos = b.pos + 1;
+        Stmt* s = new_stmt(b, X_ST_BLOCK);
+        if (s == null) {
+            return null;
+        }
+        while (b_pk(b) != K_RBRACE) {
+            Stmt* q = b_stmt(b);
+            if (q == null || g_berr != 0) {
+                return null;
+            }
+            s.stmts = vpush(s.stmts, q as u8*);
+            if (g_berr != 0) {
+                return null;
+            }
+        }
+        b_expect(b, K_RBRACE, "'}'");
+        s.stmts = s.stmts;
+        return s;
+    }
+    if (k == K_IF) {
+        b.pos = b.pos + 1;
+        if (b_expect(b, K_LPAREN, "'('") == null) {
+            return null;
+        }
+        Expr* c = b_expr(b);
+        if (c == null || g_berr != 0) {
+            return null;
+        }
+        if (b_expect(b, K_RPAREN, "')'") == null) {
+            return null;
+        }
+        if (b_expect(b, K_LBRACE, "'{'") == null) {
+            return null;
+        }
+        Stmt* s = new_stmt(b, X_ST_IF);
+        if (s == null) {
+            return null;
+        }
+        s.cond = c;
+        s.cond_ex = c;
+        u8* om = zac(&b.arena, 16);
+        if (om == null) {
+            return null;
+        }
+        BlkOut* o = om as BlkOut*;
+        b_block_body(b, o);
+        if (g_berr != 0) {
+            return null;
+        }
+        s.then_s = o.ss;
+        s.then_t = o.t;
+        if (b_expect(b, K_RBRACE, "'}'") == null) {
+            return null;
+        }
+        while (b_match(b, K_ELSE)) {
+            if (b_pk(b) == K_IF) {
+                b.pos = b.pos + 1;
+                if (b_expect(b, K_LPAREN, "'('") == null) {
+                    return null;
+                }
+                Expr* cc = b_expr(b);
+                if (cc == null) {
+                    return null;
+                }
+                if (b_expect(b, K_RPAREN, "')'") == null) {
+                    return null;
+                }
+                if (b_expect(b, K_LBRACE, "'{'") == null) {
+                    return null;
+                }
+                u8* o2m = zac(&b.arena, 16);
+                if (o2m == null) {
+                    return null;
+                }
+                BlkOut* o2 = o2m as BlkOut*;
+                b_block_body(b, o2);
+                if (g_berr != 0) {
+                    return null;
+                }
+                if (b_expect(b, K_RBRACE, "'}'") == null) {
+                    return null;
+                }
+                u8* em = zac(&b.arena, 32);
+                if (em == null) {
+                    return null;
+                }
+                EIF* ei = em as EIF*;
+                ei.c = cc;
+                ei.e = cc;
+                ei.s = o2.ss;
+                ei.t = o2.t;
+                s.eifs = vpush(s.eifs, ei as u8*);
+                if (g_berr != 0) {
+                    return null;
+                }
+            } else {
+                if (b_expect(b, K_LBRACE, "'{'") == null) {
+                    return null;
+                }
+                u8* o3m = zac(&b.arena, 16);
+                if (o3m == null) {
+                    return null;
+                }
+                BlkOut* o3 = o3m as BlkOut*;
+                b_block_body(b, o3);
+                if (g_berr != 0) {
+                    return null;
+                }
+                if (b_expect(b, K_RBRACE, "'}'") == null) {
+                    return null;
+                }
+                s.els = o3.ss;
+                s.els_t = o3.t;
+                s.has_els = true;
+                break;
+            }
+        }
+        return s;
+    }
+    if (k == K_WHILE) {
+        b.pos = b.pos + 1;
+        if (b_expect(b, K_LPAREN, "'('") == null) {
+            return null;
+        }
+        Expr* c = b_expr(b);
+        if (c == null) {
+            return null;
+        }
+        if (b_expect(b, K_RPAREN, "')'") == null) {
+            return null;
+        }
+        if (b_expect(b, K_LBRACE, "'{'") == null) {
+            return null;
+        }
+        Stmt* s = new_stmt(b, X_ST_WHILE);
+        if (s == null) {
+            return null;
+        }
+        s.cond = c;
+        s.cond_ex = c;
+        u8* om = zac(&b.arena, 16);
+        if (om == null) {
+            return null;
+        }
+        BlkOut* o = om as BlkOut*;
+        b_block_body(b, o);
+        if (g_berr != 0) {
+            return null;
+        }
+        if (b_expect(b, K_RBRACE, "'}'") == null) {
+            return null;
+        }
+        s.then_s = o.ss;
+        s.then_t = o.t;
+        return s;
+    }
+    if (k == K_FOR) {
+        b.pos = b.pos + 1;
+        if (b_expect(b, K_LPAREN, "'('") == null) {
+            return null;
+        }
+        Stmt* s = new_stmt(b, X_ST_FOR_C);
+        if (s == null) {
+            return null;
+        }
+        if (b_pk(b) != K_SEMI) {
+            u64 save = b.pos;
+            mut u64 p = save;
+            if (tok_at(b, p).kind == K_MUT) {
+                p = p + 1;
+            }
+            i32 f = tok_at(b, p).kind;
+            mut bool isdecl = false;
+            if (f == K_MUT || f == K_AUTO || f == K_CONST || b_is_prim(f)) {
+                isdecl = true;
+            } else if (f == K_IDENT) {
+                isdecl = false;
+            }
+            if (isdecl) {
+                bool ismut = b_match(b, K_MUT);
+                Type* ty = b_type(b);
+                if (ty == null || g_berr != 0) {
+                    return null;
+                }
+                TkTok* nm = b_expect(b, K_IDENT, "name");
+                if (nm == null) {
+                    return null;
+                }
+                if (b_expect(b, K_EQ, "'='") == null) {
+                    return null;
+                }
+                Expr* init = b_expr(b);
+                if (init == null || g_berr != 0) {
+                    return null;
+                }
+                Stmt* d = new_stmt(b, X_ST_DECL);
+                if (d == null) {
+                    return null;
+                }
+                d.is_mut = ismut;
+                d.ty = ty;
+                d.names = vpush(d.names, b_tokstr(b, nm) as u8*);
+                d.inits = vpush(d.inits, init as u8*);
+                s.for_init_decl = d;
+                s.for_init_is_decl = true;
+            } else {
+                Expr* e1 = b_expr(b);
+                if (e1 == null || g_berr != 0) {
+                    return null;
+                }
+                Stmt* q = new_stmt(b, X_ST_SIMPLE);
+                if (q == null) {
+                    return null;
+                }
+                q.e1 = e1;
+                if (b_is_assign(b_pk(b))) {
+                    q.op = b_pk(b);
+                    b.pos = b.pos + 1;
+                    q.e2 = b_expr(b);
+                    if (q.e2 == null || g_berr != 0) {
+                        return null;
+                    }
+                    q.has_assign = true;
+                }
+                s.for_init_simple = q;
+                s.for_init_is_decl = false;
+            }
+        } else {
+            s.for_init_empty = true;
+        }
+        if (b_expect(b, K_SEMI, "';'") == null) {
+            return null;
+        }
+        if (b_pk(b) != K_SEMI) {
+            s.for_cond = b_expr(b);
+            if (s.for_cond == null || g_berr != 0) {
+                return null;
+            }
+            s.has_for_cond = true;
+        }
+        if (b_expect(b, K_SEMI, "';'") == null) {
+            return null;
+        }
+        if (b_pk(b) != K_RPAREN) {
+            Expr* e1 = b_expr(b);
+            if (e1 == null || g_berr != 0) {
+                return null;
+            }
+            Stmt* q = new_stmt(b, X_ST_SIMPLE);
+            if (q == null) {
+                return null;
+            }
+            q.e1 = e1;
+            if (b_is_assign(b_pk(b))) {
+                q.op = b_pk(b);
+                b.pos = b.pos + 1;
+                q.e2 = b_expr(b);
+                if (q.e2 == null || g_berr != 0) {
+                    return null;
+                }
+                q.has_assign = true;
+            }
+            s.for_incr = q;
+            s.has_incr = true;
+        }
+        if (b_expect(b, K_RPAREN, "')'") == null) {
+            return null;
+        }
+        if (b_expect(b, K_LBRACE, "'{'") == null) {
+            return null;
+        }
+        u8* om = zac(&b.arena, 16);
+        if (om == null) {
+            return null;
+        }
+        BlkOut* o = om as BlkOut*;
+        b_block_body(b, o);
+        if (g_berr != 0) {
+            return null;
+        }
+        if (b_expect(b, K_RBRACE, "'}'") == null) {
+            return null;
+        }
+        s.then_s = o.ss;
+        s.then_t = o.t;
+        return s;
+    }
+    if (k == K_MATCH) {
+        b.pos = b.pos + 1;
+        mut Expr* scr = null;
+        if (b_match(b, K_LPAREN)) {
+            scr = b_expr(b);
+            if (scr == null || g_berr != 0) {
+                return null;
+            }
+            if (b_expect(b, K_RPAREN, "')'") == null) {
+                return null;
+            }
+        } else {
+            scr = b_expr(b);
+            if (scr == null || g_berr != 0) {
+                return null;
+            }
+        }
+        if (b_expect(b, K_LBRACE, "'{'") == null) {
+            return null;
+        }
+        Stmt* s = new_stmt(b, X_ST_MATCH_STMT);
+        if (s == null) {
+            return null;
+        }
+        s.m_scrut = scr;
+        if (b_pk(b) != K_RBRACE) {
+            while (true) {
+                Pat* pat = b_pattern(b);
+                if (pat == null || g_berr != 0) {
+                    return null;
+                }
+                mut Expr* guard = null;
+                if (b_pk(b) == K_IF) {
+                    b.pos = b.pos + 1;
+                    guard = b_expr(b);
+                    if (guard == null || g_berr != 0) {
+                        return null;
+                    }
+                }
+                if (b_expect(b, K_FATARROW, "'=>'") == null) {
+                    return null;
+                }
+                if (b_pk(b) != K_LBRACE) {
+                    g_berr = "match arms need block bodies in core (=> {...})" as u64;
+                    return null;
+                }
+                b.pos = b.pos + 1;
+                u8* om = zac(&b.arena, 16);
+                if (om == null) {
+                    return null;
+                }
+                BlkOut* o = om as BlkOut*;
+                b_block_body(b, o);
+                if (g_berr != 0) {
+                    return null;
+                }
+                if (o.t != null) {
+                    g_berr = "trailing block values TODO in core" as u64;
+                    return null;
+                }
+                if (b_expect(b, K_RBRACE, "'}'") == null) {
+                    return null;
+                }
+                u8* am = zac(&b.arena, 24);
+                if (am == null) {
+                    return null;
+                }
+                ArmS* ma = am as ArmS*;
+                ma.pat = pat;
+                ma.guard = guard;
+                ma.bs = o.ss;
+                s.m_arms = vpush(s.m_arms, ma as u8*);
+                if (g_berr != 0) {
+                    return null;
+                }
+                if (!b_match(b, K_COMMA)) {
+                    break;
+                }
+                if (b_pk(b) == K_RBRACE) {
+                    break;
+                }
+            }
+        }
+        if (b_expect(b, K_RBRACE, "'}'") == null) {
+            return null;
+        }
+        return s;
+    }
+    if (k == K_RETURN) {
+        b.pos = b.pos + 1;
+        Stmt* s = new_stmt(b, X_ST_RETURN);
+        if (s == null) {
+            return null;
+        }
+        if (b_pk(b) != K_SEMI) {
+            s.ret_e = b_expr(b);
+            if (s.ret_e == null || g_berr != 0) {
+                return null;
+            }
+            s.has_ret = true;
+        }
+        if (b_expect(b, K_SEMI, "';'") == null) {
+            return null;
+        }
+        return s;
+    }
+    if (k == K_BREAK) {
+        b.pos = b.pos + 1;
+        Stmt* s = new_stmt(b, X_ST_BREAK);
+        if (s == null) {
+            return null;
+        }
+        if (b_expect(b, K_SEMI, "';'") == null) {
+            return null;
+        }
+        return s;
+    }
+    if (k == K_CONTINUE) {
+        b.pos = b.pos + 1;
+        Stmt* s = new_stmt(b, X_ST_CONTINUE);
+        if (s == null) {
+            return null;
+        }
+        if (b_expect(b, K_SEMI, "';'") == null) {
+            return null;
+        }
+        return s;
+    }
+    u64 save = b.pos;
+    mut u64 p = save;
+    if (tok_at(b, p).kind == K_MUT) {
+        p = p + 1;
+    }
+    i32 f = tok_at(b, p).kind;
+    if (f == K_AUTO || f == K_CONST || b_is_prim(f) || f == K_IDENT || f == K_SELF) {
+        mut i32 angle = 0;
+        mut i32 par = 0;
+        mut i32 br = 0;
+        mut bool found = false;
+        mut u64 i = p;
+        while (i < b.count) {
+            i32 kk = tok_at(b, i).kind;
+            if (kk == K_LT) {
+                angle = angle + 1;
+            } else if (kk == K_GT) {
+                if (angle > 0) {
+                    angle = angle - 1;
+                }
+            } else if (kk == K_LPAREN) {
+                par = par + 1;
+            } else if (kk == K_RPAREN) {
+                if (par > 0) {
+                    par = par - 1;
+                } else {
+                    break;
+                }
+            } else if (kk == K_LBRACK) {
+                br = br + 1;
+            } else if (kk == K_RBRACK) {
+                if (br > 0) {
+                    br = br - 1;
+                }
+            } else if (kk == K_SEMI || kk == K_LBRACE || kk == K_RBRACE) {
+                break;
+            }
+            if (angle == 0 && par == 0 && br == 0) {
+                if (kk == K_DOT) {
+                    found = false;
+                    break;
+                }
+                if (kk == K_IDENT && i + 1 < b.count && tok_at(b, i + 1).kind == K_EQ) {
+                    if (i > save) {
+                        found = true;
+                    }
+                    break;
+                }
+            }
+            i = i + 1;
+        }
+        if (found) {
+            bool ismut = b_match(b, K_MUT);
+            Type* ty = b_type(b);
+            if (ty == null || g_berr != 0) {
+                return null;
+            }
+            TkTok* nm = b_expect(b, K_IDENT, "name");
+            if (nm == null) {
+                return null;
+            }
+            if (b_expect(b, K_EQ, "'='") == null) {
+                return null;
+            }
+            Expr* init = b_expr(b);
+            if (init == null || g_berr != 0) {
+                return null;
+            }
+            Stmt* s = new_stmt(b, X_ST_DECL);
+            if (s == null) {
+                return null;
+            }
+            s.is_mut = ismut;
+            s.ty = ty;
+            s.names = vpush(s.names, b_tokstr(b, nm) as u8*);
+            s.inits = vpush(s.inits, init as u8*);
+            if (b_expect(b, K_SEMI, "';'") == null) {
+                return null;
+            }
+            return s;
+        }
+    }
+    Expr* e1 = b_expr(b);
+    if (e1 == null || g_berr != 0) {
+        return null;
+    }
+    Stmt* s = new_stmt(b, X_ST_SIMPLE);
+    if (s == null) {
+        return null;
+    }
+    s.e1 = e1;
+    if (b_is_assign(b_pk(b))) {
+        s.op = b_pk(b);
+        b.pos = b.pos + 1;
+        s.e2 = b_expr(b);
+        if (s.e2 == null || g_berr != 0) {
+            return null;
+        }
+        s.has_assign = true;
+    }
+    if (b_expect(b, K_SEMI, "';'") == null) {
+        return null;
+    }
+    return s;
+}
+
+
+fn b_items(TkB* b, mut Vec* items) -> bool {
+    while (tok_at(b, b.pos).kind != K_EOF) {
+        i32 k = b_pk(b);
+        if (k == K_IMPORT) {
+            b.pos = b.pos + 1;
+            TkTok* t0 = tok_at(b, b.pos);
+            if (!(t0.kind == K_IDENT || t0.kind == K_SELF)) {
+                g_berr = "expected import path" as u64;
+                return false;
+            }
+            while (true) {
+                TkTok* tc = tok_at(b, b.pos);
+                if (!(tc.kind == K_IDENT || tc.kind == K_SELF || tc.kind == K_COLON2)) {
+                    break;
+                }
+                b.pos = b.pos + 1;
+                TkTok* prev = tok_at(b, b.pos - 1);
+                if (prev.kind == K_COLON2) {
+                    if (b_pk(b) != K_IDENT) {
+                        g_berr = "bad import" as u64;
+                        return false;
+                    }
+                } else if (b_pk(b) == K_COLON2) {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            if (b_expect(b, K_SEMI, "';'") == null) {
+                return false;
+            }
+            continue;
+        }
+        if (k == K_EXTERN) {
+            b.pos = b.pos + 1;
+            if (b_pk(b) == K_STRING) {
+                b.pos = b.pos + 1;
+            }
+            if (b_expect(b, K_FN, "'fn'") == null) {
+                return false;
+            }
+            TkTok* nm = b_expect(b, K_IDENT, "name");
+            if (nm == null) {
+                return false;
+            }
+            if (b_expect(b, K_LPAREN, "'('") == null) {
+                return false;
+            }
+            u8* im = zac(&b.arena, 112);
+            if (im == null) {
+                return false;
+            }
+            Item* it = im as Item*;
+            it.kind = X_IT_EXTERN;
+            it.fn_name = b_tokstr(b, nm);
+            if (b_pk(b) != K_RPAREN) {
+                while (true) {
+                    bool ism = b_match(b, K_MUT);
+                    Type* ty = b_type(b);
+                    if (ty == null || g_berr != 0) {
+                        return false;
+                    }
+                    TkTok* pn = b_expect(b, K_IDENT, "param");
+                    if (pn == null) {
+                        return false;
+                    }
+                    u8* pm = zac(&b.arena, 24);
+                    if (pm == null) {
+                        return false;
+                    }
+                    Param* pp = pm as Param*;
+                    pp.is_mut = ism;
+                    pp.ty = ty;
+                    pp.nm = b_tokstr(b, pn);
+                    it.params = vpush(it.params, pp as u8*);
+                    if (g_berr != 0) {
+                        return false;
+                    }
+                    if (!b_match(b, K_COMMA)) {
+                        break;
+                    }
+                    if (b_pk(b) == K_RPAREN) {
+                        break;
+                    }
+                }
+                if (g_berr != 0) {
+                    return false;
+                }
+            }
+            if (b_expect(b, K_RPAREN, "')'") == null) {
+                return false;
+            }
+            if (b_match(b, K_ARROW)) {
+                it.ret = b_type(b);
+                if (it.ret == null || g_berr != 0) {
+                    return false;
+                }
+            }
+            if (b_expect(b, K_SEMI, "';'") == null) {
+                return false;
+            }
+            it.body = it.body;
+            items = vpush(items, it as u8*);
+            continue;
+        }
+        if (k == K_STRUCT) {
+            b.pos = b.pos + 1;
+            TkTok* nm = b_expect(b, K_IDENT, "struct");
+            if (nm == null) {
+                return false;
+            }
+            if (b_pk(b) == K_LT) {
+                g_berr = "generics not in core builder" as u64;
+                return false;
+            }
+            if (b_expect(b, K_LBRACE, "'{'") == null) {
+                return false;
+            }
+            u8* im = zac(&b.arena, 112);
+            if (im == null) {
+                return false;
+            }
+            Item* it = im as Item*;
+            it.kind = X_IT_STRUCT;
+            it.sname = b_tokstr(b, nm);
+            if (b_pk(b) != K_RBRACE) {
+                while (true) {
+                    Type* ty = b_type(b);
+                    if (ty == null || g_berr != 0) {
+                        return false;
+                    }
+                    TkTok* fld = b_expect(b, K_IDENT, "field");
+                    if (fld == null) {
+                        return false;
+                    }
+                    u8* fm = zac(&b.arena, 16);
+                    if (fm == null) {
+                        return false;
+                    }
+                    SFld* ff = fm as SFld*;
+                    ff.ty = ty;
+                    ff.nm = b_tokstr(b, fld);
+                    it.fields = vpush(it.fields, ff as u8*);
+                    if (g_berr != 0) {
+                        return false;
+                    }
+                    if (!b_match(b, K_COMMA)) {
+                        break;
+                    }
+                    if (b_pk(b) == K_RBRACE) {
+                        break;
+                    }
+                }
+                if (g_berr != 0) {
+                    return false;
+                }
+            }
+            if (b_expect(b, K_RBRACE, "'}'") == null) {
+                return false;
+            }
+            items = vpush(items, it as u8*);
+            continue;
+        }
+        if (k == K_ENUM) {
+            b.pos = b.pos + 1;
+            TkTok* nm = b_expect(b, K_IDENT, "enum");
+            if (nm == null) {
+                return false;
+            }
+            if (b_expect(b, K_LBRACE, "'{'") == null) {
+                return false;
+            }
+            u8* im = zac(&b.arena, 112);
+            if (im == null) {
+                return false;
+            }
+            Item* it = im as Item*;
+            it.kind = X_IT_ENUM;
+            it.ename = b_tokstr(b, nm);
+            if (b_pk(b) != K_RBRACE) {
+                while (true) {
+                    TkTok* vn = b_expect(b, K_IDENT, "variant");
+                    if (vn == null) {
+                        return false;
+                    }
+                    u8* vm = zac(&b.arena, 64);
+                    if (vm == null) {
+                        return false;
+                    }
+                    Variant* vv = vm as Variant*;
+                    vv.vn = b_tokstr(b, vn);
+                    it.vars = vpush(it.vars, vv as u8*);
+                    if (g_berr != 0) {
+                        return false;
+                    }
+                    if (b_match(b, K_LPAREN)) {
+                        vv.has_tuple = true;
+                        if (b_pk(b) != K_RPAREN) {
+                            while (true) {
+                                Type* t = b_type(b);
+                                if (t == null || g_berr != 0) {
+                                    return false;
+                                }
+                                vv.ts = vpush(vv.ts, t as u8*);
+                                if (g_berr != 0) {
+                                    return false;
+                                }
+                                if (!b_match(b, K_COMMA)) {
+                                    break;
+                                }
+                                if (b_pk(b) == K_RPAREN) {
+                                    break;
+                                }
+                            }
+                            if (g_berr != 0) {
+                                return false;
+                            }
+                        }
+                        if (b_expect(b, K_RPAREN, "')'") == null) {
+                            return false;
+                        }
+                    } else if (b_match(b, K_LBRACE)) {
+                        vv.has_struct = true;
+                        if (b_pk(b) != K_RBRACE) {
+                            while (true) {
+                                Type* t = b_type(b);
+                                if (t == null || g_berr != 0) {
+                                    return false;
+                                }
+                                TkTok* fld = b_expect(b, K_IDENT, "field");
+                                if (fld == null) {
+                                    return false;
+                                }
+                                u8* fm = zac(&b.arena, 16);
+                                if (fm == null) {
+                                    return false;
+                                }
+                                SFld* vf = fm as SFld*;
+                                vf.ty = t;
+                                vf.nm = b_tokstr(b, fld);
+                                vv.fs = vpush(vv.fs, vf as u8*);
+                                if (g_berr != 0) {
+                                    return false;
+                                }
+                                if (!b_match(b, K_COMMA)) {
+                                    break;
+                                }
+                                if (b_pk(b) == K_RBRACE) {
+                                    break;
+                                }
+                            }
+                            if (g_berr != 0) {
+                                return false;
+                            }
+                        }
+                        if (b_expect(b, K_RBRACE, "'}'") == null) {
+                            return false;
+                        }
+                    }
+                    if (b_match(b, K_EQ)) {
+                        Expr* d = b_expr(b);
+                        if (d == null || g_berr != 0) {
+                            return false;
+                        }
+                        vv.has_disc = true;
+                        vv.disc = d;
+                    }
+                    if (!b_match(b, K_COMMA)) {
+                        break;
+                    }
+                    if (b_pk(b) == K_RBRACE) {
+                        break;
+                    }
+                }
+                if (g_berr != 0) {
+                    return false;
+                }
+            }
+            if (b_expect(b, K_RBRACE, "'}'") == null) {
+                return false;
+            }
+            items = vpush(items, it as u8*);
+            continue;
+        }
+        if (k == K_FN) {
+            b.pos = b.pos + 1;
+            TkTok* nm = b_expect(b, K_IDENT, "fn");
+            if (nm == null) {
+                return false;
+            }
+            if (b_pk(b) == K_LT) {
+                g_berr = "generics not in core builder" as u64;
+                return false;
+            }
+            if (b_expect(b, K_LPAREN, "'('") == null) {
+                return false;
+            }
+            u8* im = zac(&b.arena, 112);
+            if (im == null) {
+                return false;
+            }
+            Item* it = im as Item*;
+            it.kind = X_IT_FN;
+            it.fn_name = b_tokstr(b, nm);
+            if (b_pk(b) != K_RPAREN) {
+                while (true) {
+                    bool ism = b_match(b, K_MUT);
+                    Type* ty = b_type(b);
+                    if (ty == null || g_berr != 0) {
+                        return false;
+                    }
+                    TkTok* pn = b_expect(b, K_IDENT, "param");
+                    if (pn == null) {
+                        return false;
+                    }
+                    u8* pm = zac(&b.arena, 24);
+                    if (pm == null) {
+                        return false;
+                    }
+                    Param* pp = pm as Param*;
+                    pp.is_mut = ism;
+                    pp.ty = ty;
+                    pp.nm = b_tokstr(b, pn);
+                    it.params = vpush(it.params, pp as u8*);
+                    if (g_berr != 0) {
+                        return false;
+                    }
+                    if (!b_match(b, K_COMMA)) {
+                        break;
+                    }
+                    if (b_pk(b) == K_RPAREN) {
+                        break;
+                    }
+                }
+                if (g_berr != 0) {
+                    return false;
+                }
+            }
+            if (b_expect(b, K_RPAREN, "')'") == null) {
+                return false;
+            }
+            if (b_pk(b) == K_LT) {
+                g_berr = "effect rows not in core builder (validation OK)" as u64;
+                return false;
+            }
+            if (b_match(b, K_ARROW)) {
+                it.ret = b_type(b);
+                if (it.ret == null || g_berr != 0) {
+                    return false;
+                }
+            }
+            if (b_match(b, K_SEMI)) {
+                it.is_proto = true;
+                items = vpush(items, it as u8*);
+                continue;
+            }
+            if (b_expect(b, K_LBRACE, "'{'") == null) {
+                return false;
+            }
+            u8* om = zac(&b.arena, 16);
+            if (om == null) {
+                return false;
+            }
+            BlkOut* o = om as BlkOut*;
+            b_block_body(b, o);
+            if (g_berr != 0) {
+                return false;
+            }
+            if (b_expect(b, K_RBRACE, "'}'") == null) {
+                return false;
+            }
+            it.is_proto = false;
+            it.body = o.ss;
+            it.trail = o.t;
+            items = vpush(items, it as u8*);
+            continue;
+        }
+        bool ism = b_match(b, K_MUT);
+        Type* ty = b_type(b);
+        if (ty == null || g_berr != 0) {
+            if (g_berr == 0) {
+                g_berr = "expected item" as u64;
+            }
+            return false;
+        }
+        TkTok* nm = b_expect(b, K_IDENT, "global");
+        if (nm == null) {
+            return false;
+        }
+        if (b_expect(b, K_EQ, "'='") == null) {
+            return false;
+        }
+        Expr* init = b_expr(b);
+        if (init == null || g_berr != 0) {
+            return false;
+        }
+        if (b_expect(b, K_SEMI, "';'") == null) {
+            return false;
+        }
+        u8* im = zac(&b.arena, 112);
+        if (im == null) {
+            return false;
+        }
+        Item* it = im as Item*;
+        it.kind = X_IT_GLOBAL;
+        u8* dm = zac(&b.arena, 272);
+        if (dm == null) {
+            return false;
+        }
+        Stmt* d = dm as Stmt*;
+        d.kind = X_ST_DECL;
+        d.is_mut = ism;
+        d.ty = ty;
+        d.names = vpush(d.names, b_tokstr(b, nm) as u8*);
+        d.inits = vpush(d.inits, init as u8*);
+        it.gdecl = d;
+        items = vpush(items, it as u8*);
+    }
+    return true;
+}
+
+
+struct Buf { u8* data, u64 len, u64 cap, }
+
+fn buf_new() -> Buf* {
+    u8* m = tk_malloc(24);
+    Buf* b = m as Buf*;
+    b.data = null;
+    b.len = 0;
+    b.cap = 0;
+    return b;
+}
+
+fn buf_reserve(Buf* b, u64 extra) {
+    while (b.len + extra > b.cap) {
+        mut u64 ncap = 256;
+        if (b.cap != 0) {
+            ncap = b.cap + b.cap;
+        }
+        u8* nm = tk_malloc(ncap);
+        mut u64 i = 0;
+        while (i < b.len) {
+            nm[i] = b.data[i];
+            i = i + 1;
+        }
+        b.data = nm;
+        b.cap = ncap;
+    }
+    return;
+}
+
+fn buf_putc(Buf* b, u8 c) {
+    buf_reserve(b, 1);
+    b.data[b.len] = c;
+    b.len = b.len + 1;
+    return;
+}
+
+fn buf_puts(Buf* b, u8* s, u64 n) {
+    buf_reserve(b, n);
+    mut u64 i = 0;
+    while (i < n) {
+        b.data[b.len + i] = s[i];
+        i = i + 1;
+    }
+    b.len = b.len + n;
+    return;
+}
+
+fn buf_puts_c(Buf* b, char* s) {
+    buf_puts(b, s as u8*, tk_strlen(s));
+    return;
+}
+
+fn buf_puti(Buf* b, Arena* a, i32 v) {
+    sview s = i32_to_str(v, a);
+    buf_puts(b, s.ptr as u8*, s.len as u64);
+    return;
+}
+
+fn b2i(bool v) -> i32 {
+    if (v) {
+        return 1;
+    }
+    return 0;
+}
+
+fn buf_esc(Buf* b, u8* s, u64 n) {
+    buf_putc(b, 34);
+    mut u64 i = 0;
+    while (i < n) {
+        u8 c = s[i];
+        if (c == 34) {
+            buf_putc(b, 92);
+            buf_putc(b, 34);
+        } else if (c == 92) {
+            buf_putc(b, 92);
+            buf_putc(b, 92);
+        } else if (c == 10) {
+            buf_putc(b, 92);
+            buf_putc(b, 110);
+        } else {
+            buf_putc(b, c);
+        }
+        i = i + 1;
+    }
+    buf_putc(b, 34);
+    return;
+}
+
+fn dump_type(Buf* b, Arena* a, Type* t) {
+    if (t == null) {
+        buf_putc(b, 48);
+        return;
+    }
+    buf_putc(b, 40);
+    buf_puts_c(b, "ty ");
+    if (t.kind == X_TY_PRIM) {
+        buf_puti(b, a, t.prim);
+    } else if (t.kind == X_TY_AUTO) {
+        buf_puts_c(b, "auto");
+    } else if (t.kind == X_TY_PATH) {
+        buf_puts_c(b, "(path (");
+        mut u64 i = 0;
+        while (i < vlen(t.path)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            char* s = vec_get(t.path, i) as char*;
+            buf_esc(b, s as u8*, tk_strlen(s));
+            i = i + 1;
+        }
+        buf_puts_c(b, ") (");
+        i = 0;
+        while (i < vlen(t.gargs)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            dump_type(b, a, vec_get(t.gargs, i) as Type*);
+            i = i + 1;
+        }
+        buf_puts_c(b, "))");
+    } else if (t.kind == X_TY_TUPLE) {
+        buf_puts_c(b, "(tupTODO)");
+    } else if (t.kind == X_TY_ARRAY) {
+        buf_puts_c(b, "(arrTODO)");
+    } else if (t.kind == X_TY_FN) {
+        buf_puts_c(b, "(fn)");
+    } else if (t.kind == X_TY_DYN) {
+        buf_puts_c(b, "(dyn)");
+    } else {
+        buf_putc(b, 63);
+    }
+    buf_putc(b, 32);
+    buf_puti(b, a, t.stars);
+    buf_putc(b, 32);
+    buf_puti(b, a, b2i(t.is_ref));
+    buf_putc(b, 32);
+    buf_puti(b, a, b2i(t.is_const));
+    buf_putc(b, 41);
+    return;
+}
+
+fn dump_expr(Buf* b, Arena* a, Expr* e) {
+    if (e == null) {
+        buf_putc(b, 48);
+        return;
+    }
+    buf_putc(b, 40);
+    buf_puti(b, a, e.kind);
+    if (e.kind == X_EX_INT || e.kind == X_EX_FLOAT || e.kind == X_EX_STRING || e.kind == X_EX_CHAR || e.kind == X_EX_BOOL) {
+        buf_putc(b, 32);
+        buf_esc(b, e.tok.start, e.tok.len);
+    } else if (e.kind == X_EX_NULL || e.kind == X_EX_UNDEF) {
+    } else if (e.kind == X_EX_VAR) {
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(e.path)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            char* s = vec_get(e.path, i) as char*;
+            buf_esc(b, s as u8*, tk_strlen(s));
+            i = i + 1;
+        }
+        buf_puts_c(b, ") ()");
+    } else if (e.kind == X_EX_PAREN) {
+        buf_putc(b, 32);
+        dump_expr(b, a, e.lhs);
+    } else if (e.kind == X_EX_STRUCT_LIT) {
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(e.path)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            char* s = vec_get(e.path, i) as char*;
+            buf_esc(b, s as u8*, tk_strlen(s));
+            i = i + 1;
+        }
+        buf_puts_c(b, ") (");
+        i = 0;
+        while (i < vlen(e.sfields)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            SF* sf = vec_get(e.sfields, i) as SF*;
+            buf_putc(b, 40);
+            buf_esc(b, sf.field as u8*, tk_strlen(sf.field));
+            buf_putc(b, 32);
+            dump_expr(b, a, sf.e);
+            buf_putc(b, 41);
+            i = i + 1;
+        }
+        buf_putc(b, 41);
+    } else if (e.kind == X_EX_ARRAY_LIST) {
+        mut u64 i = 0;
+        while (i < vlen(e.elems)) {
+            buf_putc(b, 32);
+            dump_expr(b, a, vec_get(e.elems, i) as Expr*);
+            i = i + 1;
+        }
+    } else if (e.kind == X_EX_MATCH) {
+        buf_putc(b, 32);
+        dump_expr(b, a, e.scrut);
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(e.arms)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            ArmE* am = vec_get(e.arms, i) as ArmE*;
+            buf_putc(b, 40);
+            dump_pat(b, a, am.pat);
+            buf_putc(b, 32);
+            dump_expr(b, a, am.guard);
+            buf_putc(b, 32);
+            dump_expr(b, a, am.body);
+            buf_putc(b, 41);
+            i = i + 1;
+        }
+        buf_putc(b, 41);
+    } else if (e.kind == X_EX_UNARY) {
+        buf_putc(b, 32);
+        buf_puti(b, a, e.op);
+        buf_putc(b, 32);
+        dump_expr(b, a, e.lhs);
+    } else if (e.kind == X_EX_BINARY) {
+        buf_putc(b, 32);
+        buf_puti(b, a, e.op);
+        buf_putc(b, 32);
+        dump_expr(b, a, e.lhs);
+        buf_putc(b, 32);
+        dump_expr(b, a, e.rhs);
+    } else if (e.kind == X_EX_CAST) {
+        buf_putc(b, 32);
+        dump_expr(b, a, e.lhs);
+        buf_putc(b, 32);
+        dump_type(b, a, e.cast_to);
+    } else if (e.kind == X_EX_TERNARY) {
+        buf_putc(b, 32);
+        dump_expr(b, a, e.cond);
+        buf_putc(b, 32);
+        dump_expr(b, a, e.then_e);
+        buf_putc(b, 32);
+        dump_expr(b, a, e.else_e);
+    } else if (e.kind == X_EX_CALL) {
+        buf_putc(b, 32);
+        dump_expr(b, a, e.callee);
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(e.args)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            dump_expr(b, a, vec_get(e.args, i) as Expr*);
+            i = i + 1;
+        }
+        buf_putc(b, 41);
+    } else if (e.kind == X_EX_INDEX) {
+        buf_putc(b, 32);
+        dump_expr(b, a, e.callee);
+        buf_putc(b, 32);
+        dump_expr(b, a, e.index);
+    } else if (e.kind == X_EX_FIELD) {
+        buf_putc(b, 32);
+        dump_expr(b, a, e.callee);
+        buf_putc(b, 32);
+        buf_esc(b, e.field as u8*, tk_strlen(e.field));
+    } else if (e.kind == X_EX_POST_INC || e.kind == X_EX_POST_DEC) {
+        buf_putc(b, 32);
+        dump_expr(b, a, e.lhs);
+    }
+    buf_putc(b, 41);
+    return;
+}
+
+fn dump_pat(Buf* b, Arena* a, Pat* p) {
+    if (p == null) {
+        buf_putc(b, 48);
+        return;
+    }
+    buf_putc(b, 40);
+    buf_puti(b, a, p.kind);
+    if (p.kind == X_PAT_WILD) {
+    } else if (p.kind == X_PAT_REF) {
+        buf_putc(b, 32);
+        buf_esc(b, p.name as u8*, tk_strlen(p.name));
+    } else if (p.kind == X_PAT_LIT) {
+        buf_putc(b, 32);
+        buf_puti(b, a, p.tok.kind);
+        buf_putc(b, 32);
+        buf_esc(b, p.tok.start, p.tok.len);
+    } else if (p.kind == X_PAT_BIND) {
+        buf_putc(b, 32);
+        buf_puti(b, a, b2i(p.is_mut));
+        buf_putc(b, 32);
+        buf_esc(b, p.name as u8*, tk_strlen(p.name));
+    } else if (p.kind == X_PAT_PATH) {
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(p.path)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            char* s = vec_get(p.path, i) as char*;
+            buf_esc(b, s as u8*, tk_strlen(s));
+            i = i + 1;
+        }
+        buf_puts_c(b, ") (");
+        i = 0;
+        while (i < vlen(p.args)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            dump_pat(b, a, vec_get(p.args, i) as Pat*);
+            i = i + 1;
+        }
+        buf_puts_c(b, ") (");
+        i = 0;
+        while (i < vlen(p.fields)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            FP* fp = vec_get(p.fields, i) as FP*;
+            buf_putc(b, 40);
+            buf_esc(b, fp.field as u8*, tk_strlen(fp.field));
+            buf_putc(b, 32);
+            dump_pat(b, a, fp.pat);
+            buf_putc(b, 41);
+            i = i + 1;
+        }
+        buf_putc(b, 41);
+        buf_putc(b, 32);
+        buf_puti(b, a, b2i(p.has_dotdot));
+        buf_puts_c(b, " (");
+        i = 0;
+        while (i < vlen(p.or_next)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            dump_pat(b, a, vec_get(p.or_next, i) as Pat*);
+            i = i + 1;
+        }
+        buf_putc(b, 41);
+    }
+    buf_putc(b, 41);
+    return;
+}
+
+fn dump_stmt(Buf* b, Arena* a, Stmt* s) {
+    if (s == null) {
+        buf_putc(b, 48);
+        return;
+    }
+    buf_putc(b, 40);
+    buf_puti(b, a, s.kind);
+    if (s.kind == X_ST_DECL) {
+        buf_putc(b, 32);
+        buf_puti(b, a, b2i(s.is_mut));
+        buf_putc(b, 32);
+        dump_type(b, a, s.ty);
+        buf_putc(b, 32);
+        buf_puti(b, a, vlen(s.names) as i32);
+        mut u64 i = 0;
+        while (i < vlen(s.names)) {
+            buf_puts_c(b, " (");
+            char* nm = vec_get(s.names, i) as char*;
+            buf_esc(b, nm as u8*, tk_strlen(nm));
+            buf_putc(b, 32);
+            dump_expr(b, a, vec_get(s.inits, i) as Expr*);
+            buf_putc(b, 41);
+            i = i + 1;
+        }
+    } else if (s.kind == X_ST_SIMPLE) {
+        buf_putc(b, 32);
+        dump_expr(b, a, s.e1);
+        buf_putc(b, 32);
+        if (s.has_assign) {
+            buf_puti(b, a, s.op);
+        } else {
+            buf_putc(b, 48);
+        }
+        buf_putc(b, 32);
+        if (s.has_assign) {
+            dump_expr(b, a, s.e2);
+        } else {
+            buf_putc(b, 48);
+        }
+    } else if (s.kind == X_ST_BLOCK) {
+        buf_putc(b, 32);
+        buf_puti(b, a, b2i(s.has_trailing));
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(s.stmts)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            dump_stmt(b, a, vec_get(s.stmts, i) as Stmt*);
+            i = i + 1;
+        }
+        buf_puts_c(b, ") ");
+        dump_expr(b, a, s.trailing);
+    } else if (s.kind == X_ST_MATCH_STMT) {
+        buf_putc(b, 32);
+        dump_expr(b, a, s.m_scrut);
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(s.m_arms)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            ArmS* am = vec_get(s.m_arms, i) as ArmS*;
+            buf_putc(b, 40);
+            dump_pat(b, a, am.pat);
+            buf_putc(b, 32);
+            dump_expr(b, a, am.guard);
+            buf_puts_c(b, " (");
+            mut u64 j = 0;
+            while (j < vlen(am.bs)) {
+                if (j != 0) {
+                    buf_putc(b, 32);
+                }
+                dump_stmt(b, a, vec_get(am.bs, j) as Stmt*);
+                j = j + 1;
+            }
+            buf_puts_c(b, "))");
+            i = i + 1;
+        }
+        buf_putc(b, 41);
+    } else if (s.kind == X_ST_IF) {
+        buf_putc(b, 32);
+        dump_expr(b, a, s.cond);
+        buf_putc(b, 32);
+        dump_expr(b, a, s.cond_ex);
+        buf_puts_c(b, " (");
+        mut u64 k = 0;
+        while (k < vlen(s.then_s)) {
+            if (k != 0) {
+                buf_putc(b, 32);
+            }
+            dump_stmt(b, a, vec_get(s.then_s, k) as Stmt*);
+            k = k + 1;
+        }
+        buf_puts_c(b, ") ");
+        dump_expr(b, a, s.then_t);
+        buf_puts_c(b, " (");
+        k = 0;
+        while (k < vlen(s.eifs)) {
+            if (k != 0) {
+                buf_putc(b, 32);
+            }
+            EIF* ei = vec_get(s.eifs, k) as EIF*;
+            buf_putc(b, 40);
+            dump_expr(b, a, ei.c);
+            buf_putc(b, 32);
+            dump_expr(b, a, ei.e);
+            buf_puts_c(b, " (");
+            mut u64 j = 0;
+            while (j < vlen(ei.s)) {
+                if (j != 0) {
+                    buf_putc(b, 32);
+                }
+                dump_stmt(b, a, vec_get(ei.s, j) as Stmt*);
+                j = j + 1;
+            }
+            buf_puts_c(b, ") ");
+            dump_expr(b, a, ei.t);
+            buf_putc(b, 41);
+            k = k + 1;
+        }
+        buf_puts_c(b, ") ");
+        if (s.has_els) {
+            buf_puts_c(b, "(1 (");
+            k = 0;
+            while (k < vlen(s.els)) {
+                if (k != 0) {
+                    buf_putc(b, 32);
+                }
+                dump_stmt(b, a, vec_get(s.els, k) as Stmt*);
+                k = k + 1;
+            }
+            buf_puts_c(b, ") ");
+            dump_expr(b, a, s.els_t);
+            buf_putc(b, 41);
+        } else {
+            buf_putc(b, 48);
+        }
+    } else if (s.kind == X_ST_WHILE) {
+        buf_putc(b, 32);
+        dump_expr(b, a, s.cond);
+        buf_putc(b, 32);
+        dump_expr(b, a, s.cond_ex);
+        buf_puts_c(b, " (");
+        mut u64 k = 0;
+        while (k < vlen(s.then_s)) {
+            if (k != 0) {
+                buf_putc(b, 32);
+            }
+            dump_stmt(b, a, vec_get(s.then_s, k) as Stmt*);
+            k = k + 1;
+        }
+        buf_puts_c(b, ") ");
+        dump_expr(b, a, s.then_t);
+    } else if (s.kind == X_ST_FOR_C) {
+        buf_putc(b, 32);
+        if (s.for_init_is_decl) {
+            buf_puts_c(b, "(d ");
+            dump_stmt(b, a, s.for_init_decl);
+            buf_putc(b, 41);
+        } else if (s.for_init_simple != null) {
+            buf_puts_c(b, "(s ");
+            dump_stmt(b, a, s.for_init_simple);
+            buf_putc(b, 41);
+        } else {
+            buf_putc(b, 48);
+        }
+        buf_putc(b, 32);
+        if (s.has_for_cond) {
+            dump_expr(b, a, s.for_cond);
+        } else {
+            buf_putc(b, 48);
+        }
+        buf_putc(b, 32);
+        if (s.has_incr) {
+            dump_stmt(b, a, s.for_incr);
+        } else {
+            buf_putc(b, 48);
+        }
+        buf_puts_c(b, " (");
+        mut u64 k = 0;
+        while (k < vlen(s.then_s)) {
+            if (k != 0) {
+                buf_putc(b, 32);
+            }
+            dump_stmt(b, a, vec_get(s.then_s, k) as Stmt*);
+            k = k + 1;
+        }
+        buf_puts_c(b, ") ");
+        dump_expr(b, a, s.then_t);
+    } else if (s.kind == X_ST_RETURN) {
+        buf_putc(b, 32);
+        if (s.has_ret) {
+            dump_expr(b, a, s.ret_e);
+        } else {
+            buf_putc(b, 48);
+        }
+        buf_putc(b, 32);
+        buf_puti(b, a, b2i(s.has_ret));
+    } else if (s.kind == X_ST_BREAK || s.kind == X_ST_CONTINUE) {
+        if (s.label == null) {
+            buf_puts_c(b, " 0");
+        } else {
+            buf_putc(b, 32);
+            buf_esc(b, s.label as u8*, tk_strlen(s.label));
+        }
+    }
+    buf_putc(b, 41);
+    return;
+}
+
+fn dump_item(Buf* b, Arena* a, Item* it) {
+    buf_putc(b, 40);
+    buf_puti(b, a, it.kind);
+    if (it.kind == X_IT_FN) {
+        buf_putc(b, 32);
+        buf_esc(b, it.fn_name as u8*, tk_strlen(it.fn_name));
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(it.params)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            Param* pp = vec_get(it.params, i) as Param*;
+            buf_putc(b, 40);
+            buf_puti(b, a, b2i(pp.is_mut));
+            buf_putc(b, 32);
+            dump_type(b, a, pp.ty);
+            buf_putc(b, 32);
+            buf_esc(b, pp.nm as u8*, tk_strlen(pp.nm));
+            buf_putc(b, 41);
+            i = i + 1;
+        }
+        buf_puts_c(b, ") ");
+        dump_type(b, a, it.ret);
+        buf_putc(b, 32);
+        buf_puti(b, a, b2i(it.is_proto));
+        buf_puts_c(b, " (");
+        i = 0;
+        while (i < vlen(it.body)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            dump_stmt(b, a, vec_get(it.body, i) as Stmt*);
+            i = i + 1;
+        }
+        buf_puts_c(b, ") ");
+        dump_expr(b, a, it.trail);
+    } else if (it.kind == X_IT_EXTERN) {
+        buf_puts_c(b, " 0 ");
+        buf_esc(b, it.fn_name as u8*, tk_strlen(it.fn_name));
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(it.params)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            Param* pp = vec_get(it.params, i) as Param*;
+            buf_putc(b, 40);
+            buf_puti(b, a, b2i(pp.is_mut));
+            buf_putc(b, 32);
+            dump_type(b, a, pp.ty);
+            buf_putc(b, 32);
+            buf_esc(b, pp.nm as u8*, tk_strlen(pp.nm));
+            buf_putc(b, 41);
+            i = i + 1;
+        }
+        buf_puts_c(b, ") ");
+        dump_type(b, a, it.ret);
+    } else if (it.kind == X_IT_STRUCT) {
+        buf_putc(b, 32);
+        buf_esc(b, it.sname as u8*, tk_strlen(it.sname));
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(it.fields)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            SFld* ff = vec_get(it.fields, i) as SFld*;
+            buf_puts_c(b, "(0 0 0 ");
+            dump_type(b, a, ff.ty);
+            buf_putc(b, 32);
+            buf_esc(b, ff.nm as u8*, tk_strlen(ff.nm));
+            buf_putc(b, 41);
+            i = i + 1;
+        }
+        buf_putc(b, 41);
+    } else if (it.kind == X_IT_ENUM) {
+        buf_putc(b, 32);
+        buf_esc(b, it.ename as u8*, tk_strlen(it.ename));
+        buf_puts_c(b, " (");
+        mut u64 i = 0;
+        while (i < vlen(it.vars)) {
+            if (i != 0) {
+                buf_putc(b, 32);
+            }
+            Variant* vv = vec_get(it.vars, i) as Variant*;
+            buf_putc(b, 40);
+            buf_esc(b, vv.vn as u8*, tk_strlen(vv.vn));
+            buf_putc(b, 32);
+            buf_puti(b, a, b2i(vv.has_tuple));
+            buf_putc(b, 32);
+            buf_puti(b, a, b2i(vv.has_struct));
+            buf_putc(b, 32);
+            buf_puti(b, a, b2i(vv.has_disc));
+            buf_puts_c(b, " (");
+            mut u64 j = 0;
+            while (j < vlen(vv.ts)) {
+                if (j != 0) {
+                    buf_putc(b, 32);
+                }
+                dump_type(b, a, vec_get(vv.ts, j) as Type*);
+                j = j + 1;
+            }
+            buf_puts_c(b, ") (");
+            j = 0;
+            while (j < vlen(vv.fs)) {
+                if (j != 0) {
+                    buf_putc(b, 32);
+                }
+                SFld* vf = vec_get(vv.fs, j) as SFld*;
+                buf_putc(b, 40);
+                dump_type(b, a, vf.ty);
+                buf_putc(b, 32);
+                buf_esc(b, vf.nm as u8*, tk_strlen(vf.nm));
+                buf_putc(b, 41);
+                j = j + 1;
+            }
+            buf_puts_c(b, ") ");
+            if (vv.has_disc) {
+                dump_expr(b, a, vv.disc);
+            } else {
+                buf_putc(b, 48);
+            }
+            buf_putc(b, 41);
+            i = i + 1;
+        }
+        buf_putc(b, 41);
+    } else if (it.kind == X_IT_GLOBAL) {
+        Stmt* d = it.gdecl;
+        buf_putc(b, 32);
+        buf_puti(b, a, b2i(d.is_mut));
+        buf_putc(b, 32);
+        dump_type(b, a, d.ty);
+        buf_putc(b, 32);
+        char* nm = vec_get(d.names, 0) as char*;
+        buf_esc(b, nm as u8*, tk_strlen(nm));
+        buf_putc(b, 32);
+        dump_expr(b, a, vec_get(d.inits, 0) as Expr*);
+    }
+    buf_puts_c(b, ")\n");
+    return;
+}
+
+fn dump_program(Buf* b, Arena* a, Vec* items) {
+    buf_puts_c(b, "(program\n");
+    mut u64 i = 0;
+    while (i < vlen(items)) {
+        dump_item(b, a, vec_get(items, i) as Item*);
+        i = i + 1;
+    }
+    buf_puts_c(b, ")\n");
+    return;
+}
+
+fn parse_error_at(Arena* a, TkTok* t, char* msg) {
+    sview ls = i32_to_str(t.line, a);
+    sview cs = i32_to_str(t.col, a);
+    sview kn = tk_kind_name(t.kind);
+    tk_eprint("parse error at " as u8*, 15);
+    tk_eprint(ls.ptr as u8*, ls.len as u64);
+    tk_eprint(":" as u8*, 1);
+    tk_eprint(cs.ptr as u8*, cs.len as u64);
+    tk_eprint(" near '" as u8*, 7);
+    tk_eprint(t.start, t.len);
+    tk_eprint("' (" as u8*, 3);
+    tk_eprint(kn.ptr as u8*, kn.len as u64);
+    tk_eprint("): " as u8*, 3);
+    tk_eprint(msg as u8*, tk_strlen(msg));
+    tk_eprint("\n" as u8*, 1);
+    tk_set_exit(1);
+    return;
+}
+
+
+fn main() {
+    if (tk_argc() < 2) {
+        return;
+    }
+    char* path = tk_argv(1);
+    u8* memb = tk_malloc(67108864);
+    if (memb == null) {
+        return;
+    }
+    Arena ar = arena_mk(memb, 67108864);
+    u8* f = tk_fopen(path, "r");
+    if (f == null) {
+        tk_eprint(path as u8*, tk_strlen(path));
+        tk_eprint(": No such file or directory\n" as u8*, 28);
+        tk_set_exit(1);
+        return;
+    }
+    tk_fseek(f, 0, 2);
+    i64 size = tk_ftell(f);
+    tk_fseek(f, 0, 0);
+    u64 n = size as u64;
+    u8* buf = arena_alloc(&ar, n + 8);
+    if (buf == null) {
+        return;
+    }
+    tk_fread(buf, 1, n, f);
+    tk_fclose(f);
+    mut u64 z = 0;
+    while (z < 8) {
+        buf[n + z] = 0;
+        z = z + 1;
+    }
+    u8* tbuf = arena_alloc(&ar, 8388608);
+    if (tbuf == null) {
+        return;
+    }
+    TkLex lx = TkLex { src: buf, pos: 0, line: 1, col: 1, };
+    mut u64 count = 0;
+    while (true) {
+        TkTok t = tk_next(&lx);
+        TkTok* s = (tbuf + count * 32) as TkTok*;
+        s.kind = t.kind;
+        s.start = t.start;
+        s.len = t.len;
+        s.line = t.line;
+        s.col = t.col;
+        count = count + 1;
+        if (t.kind == K_EOF) {
+            break;
+        }
+        if (count >= 262144) {
+            tk_print_str("sexp error: too many tokens");
+            tk_set_exit(1);
+            return;
+        }
+    }
+    mut u64 ei = 0;
+    while (ei < count) {
+        TkTok* te = (tbuf + ei * 32) as TkTok*;
+        if (te.kind == K_ERROR) {
+            parse_error_at(&ar, te, "bad token (lexer)");
+            return;
+        }
+        ei = ei + 1;
+    }
+    u8* bm = zac(&ar, 64);
+    if (bm == null) {
+        return;
+    }
+    TkB* b = bm as TkB*;
+    b.toks = tbuf;
+    b.count = count;
+    b.pos = 0;
+    b.arena = ar;
+    b.pend_gt = 0;
+    Vec* items = vec_new();
+    bool want_check = tk_argc() > 2 && tk_streq(tk_argv(2), "--check");
+    if (!b_items(b, items)) {
+        if (want_check) {
+            char* msg = g_berr as char*;
+            tk_eprint("taka: core backend TODO (" as u8*, 25);
+            tk_eprint(msg as u8*, tk_strlen(msg));
+            tk_eprint(") " as u8*, 2);
+            u8* em = arena_alloc(&b.arena, 3);
+            em[0] = 226;
+            em[1] = 128;
+            em[2] = 148;
+            tk_eprint(em, 3);
+            tk_eprint(" cannot build this file\n" as u8*, 24);
+            tk_set_exit(1);
+            return;
+        }
+        char* msg = g_berr as char*;
+        u64 ml = tk_strlen(msg);
+        u8* eb = arena_alloc(&b.arena, 12 + ml + 1);
+        if (eb == null) {
+            return;
+        }
+        sview p0 = tk_sview("sexp error: ", 12);
+        mut u64 o = 0;
+        mut u64 i = 0;
+        while (i < 12) {
+            eb[o] = p0.ptr[i];
+            o = o + 1;
+            i = i + 1;
+        }
+        i = 0;
+        while (i < ml) {
+            eb[o] = msg[i];
+            o = o + 1;
+            i = i + 1;
+        }
+        eb[o] = 0;
+        tk_print_str(eb as char*);
+        tk_set_exit(1);
+        return;
+    }
+    if (tk_argc() > 2 && tk_streq(tk_argv(2), "--check")) {
+        i32 rc = sema_check(items);
+        tk_set_exit(rc);
+        return;
+    }
+    Buf* out = buf_new();
+    dump_program(out, &b.arena, items);
+    tk_fwrite(out.data, 1, out.len, tk_stdout());
+    return;
+}
+
+struct ScopeVar { char* name, bool is_mut, bool is_ref, }
+struct Scope { Vec* vars, Scope* parent, }
+
+mut u64 g_serr = 0;
+mut u64 g_items = 0;
+
+fn serr(char* msg, char* detail) {
+    tk_eprint("sema error: " as u8*, 12);
+    tk_eprint(msg as u8*, tk_strlen(msg));
+    if (detail != null) {
+        tk_eprint(" '" as u8*, 2);
+        tk_eprint(detail as u8*, tk_strlen(detail));
+        tk_eprint("'" as u8*, 1);
+    }
+    tk_eprint("\n" as u8*, 1);
+    g_serr = g_serr + 1;
+    return;
+}
+
+fn scope_new(Scope* par) -> Scope* {
+    u8* m = tk_malloc(16);
+    Scope* s = m as Scope*;
+    s.vars = vec_new();
+    s.parent = par;
+    return s;
+}
+
+fn find_var(Scope* s, char* name) -> ScopeVar* {
+    mut Scope* p = s;
+    while (p != null) {
+        mut u64 i = 0;
+        while (i < vlen(p.vars)) {
+            ScopeVar* v = vec_get(p.vars, i) as ScopeVar*;
+            if (tk_streq(v.name, name)) {
+                return v;
+            }
+            i = i + 1;
+        }
+        p = p.parent;
+    }
+    return null;
+}
+
+fn scope_add(Scope* s, char* name, bool is_mut, bool is_ref) {
+    mut u64 i = 0;
+    while (i < vlen(s.vars)) {
+        ScopeVar* v = vec_get(s.vars, i) as ScopeVar*;
+        if (tk_streq(v.name, name)) {
+            serr("duplicate binding", name);
+            return;
+        }
+        i = i + 1;
+    }
+    u8* m = tk_malloc(24);
+    ScopeVar* v = m as ScopeVar*;
+    v.name = name;
+    v.is_mut = is_mut;
+    v.is_ref = is_ref;
+    s.vars = vpush(s.vars, v as u8*);
+    return;
+}
+
+fn check_pattern(Scope* s, Pat* p) {
+    if (p == null) {
+        return;
+    }
+    if (p.kind == X_PAT_BIND) {
+        scope_add(s, p.name, p.is_mut, false);
+    } else if (p.kind == X_PAT_REF) {
+        scope_add(s, p.name, false, true);
+    } else if (p.kind == X_PAT_PATH) {
+        mut u64 i = 0;
+        while (i < vlen(p.args)) {
+            check_pattern(s, vec_get(p.args, i) as Pat*);
+            i = i + 1;
+        }
+        i = 0;
+        while (i < vlen(p.fields)) {
+            FP* fp = vec_get(p.fields, i) as FP*;
+            if (fp.pat != null) {
+                check_pattern(s, fp.pat);
+            }
+            i = i + 1;
+        }
+    }
+    mut u64 j = 0;
+    while (j < vlen(p.or_next)) {
+        check_pattern(s, vec_get(p.or_next, j) as Pat*);
+        j = j + 1;
+    }
+    return;
+}
+
+fn pat_arg_simple(Pat* p) -> bool {
+    if (p == null) {
+        return true;
+    }
+    if (p.kind == X_PAT_BIND || p.kind == X_PAT_WILD || p.kind == X_PAT_LIT) {
+        return true;
+    }
+    return false;
+}
+
+fn pat_binds(Pat* p) -> bool {
+    if (p == null) {
+        return false;
+    }
+    if (p.kind == X_PAT_BIND || p.kind == X_PAT_REF) {
+        return true;
+    }
+    if (p.kind == X_PAT_PATH) {
+        mut u64 i = 0;
+        while (i < vlen(p.args)) {
+            if (pat_binds(vec_get(p.args, i) as Pat*)) {
+                return true;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < vlen(p.fields)) {
+            FP* fp = vec_get(p.fields, i) as FP*;
+            if (pat_binds(fp.pat)) {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+fn find_enum(char* name) -> Item* {
+    Vec* items = g_items as Vec*;
+    mut u64 i = 0;
+    while (i < vlen(items)) {
+        Item* it = vec_get(items, i) as Item*;
+        if (it.kind == X_IT_ENUM && tk_streq(it.ename, name)) {
+            return it;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn check_pat_alt(Pat* p) {
+    if (p == null) {
+        return;
+    }
+    if (p.kind == X_PAT_WILD || p.kind == X_PAT_LIT || p.kind == X_PAT_BIND || p.kind == X_PAT_REF) {
+        return;
+    }
+    if (p.kind == X_PAT_PATH) {
+        if (vlen(p.path) != 2) {
+            serr("qualified Enum::Variant needed in core patterns", null);
+            return;
+        }
+        char* en = vec_get(p.path, 0) as char*;
+        char* vn = vec_get(p.path, 1) as char*;
+        Item* item = find_enum(en);
+        if (item == null) {
+            serr("unknown enum in pattern", en);
+            return;
+        }
+        mut i32 vi = -1;
+        mut u64 i = 0;
+        while (i < vlen(item.vars)) {
+            Variant* vv = vec_get(item.vars, i) as Variant*;
+            if (tk_streq(vv.vn, vn)) {
+                vi = i as i32;
+                break;
+            }
+            i = i + 1;
+        }
+        if (vi < 0) {
+            serr("unknown variant in pattern", vn);
+            return;
+        }
+        Variant* vv = vec_get(item.vars, vi as u64) as Variant*;
+        if (vv.has_tuple) {
+            if (vlen(p.args) != vlen(vv.ts)) {
+                serr("wrong tuple arity in pattern", vn);
+                return;
+            }
+            i = 0;
+            while (i < vlen(p.args)) {
+                if (!pat_arg_simple(vec_get(p.args, i) as Pat*)) {
+                    serr("nested patterns TODO in core (use plain bindings)", null);
+                    return;
+                }
+                i = i + 1;
+            }
+        } else if (vv.has_struct) {
+            i = 0;
+            while (i < vlen(p.fields)) {
+                FP* fp = vec_get(p.fields, i) as FP*;
+                mut bool found = false;
+                mut u64 j = 0;
+                while (j < vlen(vv.fs)) {
+                    SFld* vf = vec_get(vv.fs, j) as SFld*;
+                    if (tk_streq(vf.nm, fp.field)) {
+                        found = true;
+                        break;
+                    }
+                    j = j + 1;
+                }
+                if (!found && !p.has_dotdot) {
+                    serr("unknown field in pattern", fp.field);
+                    return;
+                }
+                if (!pat_arg_simple(fp.pat)) {
+                    serr("nested patterns TODO in core (use plain bindings)", null);
+                    return;
+                }
+                i = i + 1;
+            }
+        } else {
+            if (vlen(p.args) != 0 || vlen(p.fields) != 0) {
+                serr("unit variant takes no pattern args", vn);
+            }
+        }
+        return;
+    }
+    return;
+}
+
+fn check_pat_variant(Pat* p) {
+    if (p == null) {
+        return;
+    }
+    if (vlen(p.or_next) > 0) {
+        if (pat_binds(p)) {
+            serr("or-pattern bindings TODO in core (keep or-branches binding-free)", null);
+            return;
+        }
+        mut u64 i = 0;
+        while (i < vlen(p.or_next)) {
+            Pat* q = vec_get(p.or_next, i) as Pat*;
+            if (pat_binds(q)) {
+                serr("or-pattern bindings TODO in core (keep or-branches binding-free)", null);
+                return;
+            }
+            check_pat_alt(q);
+            i = i + 1;
+        }
+    }
+    check_pat_alt(p);
+    return;
+}
+
+fn check_mut_assign(Scope* s, Expr* lhs) {
+    mut Expr* e = lhs;
+    while (e != null && e.kind == X_EX_PAREN) {
+        e = e.lhs;
+    }
+    if (e == null) {
+        return;
+    }
+    if (e.kind == X_EX_VAR && vlen(e.path) == 1) {
+        char* nm = vec_get(e.path, 0) as char*;
+        ScopeVar* v = find_var(s, nm);
+        if (v != null) {
+            if (!v.is_mut) {
+                serr("mutation of non-mut binding", nm);
+            }
+        } else {
+            serr("assignment to undefined variable", nm);
+        }
+    } else if (e.kind == X_EX_VAR) {
+        if (vlen(e.path) > 0) {
+            char* nm = vec_get(e.path, 0) as char*;
+            if (find_var(s, nm) == null) {
+                serr("use of undefined variable", nm);
+            }
+        }
+    } else if (e.kind == X_EX_UNARY || e.kind == X_EX_FIELD || e.kind == X_EX_INDEX) {
+        check_expr(s, e);
+    }
+    return;
+}
+
+fn expr_has_effect(Expr* e) -> bool {
+    if (e == null) {
+        return false;
+    }
+    if (e.kind == X_EX_CALL || e.kind == X_EX_PERFORM || e.kind == X_EX_HANDLE || e.kind == X_EX_RESUME || e.kind == X_EX_SPAWN || e.kind == X_EX_TRANSACT || e.kind == X_EX_POST_INC || e.kind == X_EX_POST_DEC) {
+        return true;
+    }
+    if (e.kind == X_EX_UNARY) {
+        return e.op == K_PLUSPLUS || e.op == K_MINUSMINUS;
+    }
+    if (e.kind == X_EX_BINARY) {
+        return false;
+    }
+    return false;
+}
+
+fn check_expr(Scope* s, Expr* e) {
+    if (e == null) {
+        return;
+    }
+    if (e.kind == X_EX_VAR) {
+        if (vlen(e.path) > 0) {
+            char* nm = vec_get(e.path, 0) as char*;
+            if (find_var(s, nm) == null) {
+                serr("use of undefined variable", nm);
+            }
+        }
+    } else if (e.kind == X_EX_CALL) {
+        check_expr(s, e.callee);
+        mut u64 i = 0;
+        while (i < vlen(e.args)) {
+            check_expr(s, vec_get(e.args, i) as Expr*);
+            i = i + 1;
+        }
+    } else if (e.kind == X_EX_UNARY) {
+        if (e.op == K_PLUSPLUS || e.op == K_MINUSMINUS) {
+            check_mut_assign(s, e.lhs);
+        } else {
+            check_expr(s, e.lhs);
+        }
+    } else if (e.kind == X_EX_BINARY) {
+        check_expr(s, e.lhs);
+        check_expr(s, e.rhs);
+    } else if (e.kind == X_EX_CAST) {
+        check_expr(s, e.lhs);
+    } else if (e.kind == X_EX_TERNARY) {
+        check_expr(s, e.cond);
+        check_expr(s, e.then_e);
+        check_expr(s, e.else_e);
+    } else if (e.kind == X_EX_PAREN) {
+        check_expr(s, e.lhs);
+    } else if (e.kind == X_EX_INDEX) {
+        check_expr(s, e.callee);
+        check_expr(s, e.index);
+    } else if (e.kind == X_EX_FIELD) {
+        check_expr(s, e.callee);
+    } else if (e.kind == X_EX_POST_INC || e.kind == X_EX_POST_DEC) {
+        check_mut_assign(s, e.lhs);
+    } else if (e.kind == X_EX_STRUCT_LIT) {
+        mut u64 i = 0;
+        while (i < vlen(e.sfields)) {
+            SF* sf = vec_get(e.sfields, i) as SF*;
+            check_expr(s, sf.e);
+            i = i + 1;
+        }
+    } else if (e.kind == X_EX_ARRAY_LIST) {
+        mut u64 i = 0;
+        while (i < vlen(e.elems)) {
+            check_expr(s, vec_get(e.elems, i) as Expr*);
+            i = i + 1;
+        }
+    } else if (e.kind == X_EX_MATCH) {
+        check_expr(s, e.scrut);
+        mut u64 i = 0;
+        while (i < vlen(e.arms)) {
+            ArmE* am = vec_get(e.arms, i) as ArmE*;
+            Scope* arm = scope_new(s);
+            check_pat_variant(am.pat);
+            check_pattern(arm, am.pat);
+            if (am.guard != null) {
+                check_expr(arm, am.guard);
+            }
+            if (am.body != null) {
+                check_expr(arm, am.body);
+            }
+            i = i + 1;
+        }
+    }
+    return;
+}
+
+fn check_stmts(Scope* s, Vec* ss, Expr* trail) {
+    mut u64 i = 0;
+    while (i < vlen(ss)) {
+        check_stmt(s, vec_get(ss, i) as Stmt*);
+        i = i + 1;
+    }
+    if (trail != null) {
+        check_expr(s, trail);
+    }
+    return;
+}
+
+fn check_stmt(Scope* s, Stmt* st) {
+    if (st == null) {
+        return;
+    }
+    if (st.kind == X_ST_DECL) {
+        if (st.ty != null && st.ty.kind == X_TY_PATH && st.ty.is_ref && st.is_mut) {
+            char* nm0 = vec_get(st.names, 0) as char*;
+            serr("`mut` on `&` is a checker error (14d)", nm0);
+        }
+        mut u64 i = 0;
+        while (i < vlen(st.names)) {
+            check_expr(s, vec_get(st.inits, i) as Expr*);
+            char* nm = vec_get(st.names, i) as char*;
+            mut bool isr = false;
+            if (st.ty != null && st.ty.is_ref) {
+                isr = true;
+            }
+            scope_add(s, nm, st.is_mut, isr);
+            i = i + 1;
+        }
+    } else if (st.kind == X_ST_SIMPLE) {
+        if (!st.has_assign) {
+            if (!expr_has_effect(st.e1)) {
+                mut i32 k = X_EX_NULL;
+                if (st.e1 != null) {
+                    k = st.e1.kind;
+                }
+                if (k == X_EX_VAR || k == X_EX_INT || k == X_EX_FLOAT || k == X_EX_STRING || k == X_EX_BINARY) {
+                    serr("statement with no effect", null);
+                }
+            }
+            check_expr(s, st.e1);
+        } else {
+            check_mut_assign(s, st.e1);
+            check_expr(s, st.e2);
+            if (st.e1 != null && (st.e1.kind == X_EX_UNARY || st.e1.kind == X_EX_INDEX || st.e1.kind == X_EX_FIELD)) {
+                check_expr(s, st.e1);
+            }
+        }
+    } else if (st.kind == X_ST_BLOCK) {
+        Scope* inner = scope_new(s);
+        check_stmts(inner, st.stmts, st.trailing);
+    } else if (st.kind == X_ST_IF) {
+        if (st.cond_ex != null) {
+            check_expr(s, st.cond_ex);
+        } else {
+            check_expr(s, st.cond);
+        }
+        Scope* inner = scope_new(s);
+        check_stmts(inner, st.then_s, st.then_t);
+        mut u64 i = 0;
+        while (i < vlen(st.eifs)) {
+            EIF* ei = vec_get(st.eifs, i) as EIF*;
+            Scope* es = scope_new(s);
+            if (ei.e != null) {
+                check_expr(s, ei.e);
+            } else {
+                check_expr(s, ei.c);
+            }
+            check_stmts(es, ei.s, ei.t);
+            i = i + 1;
+        }
+        if (st.has_els) {
+            Scope* el = scope_new(s);
+            check_stmts(el, st.els, st.els_t);
+        }
+    } else if (st.kind == X_ST_MATCH_STMT) {
+        check_expr(s, st.m_scrut);
+        mut u64 i = 0;
+        while (i < vlen(st.m_arms)) {
+            ArmS* am = vec_get(st.m_arms, i) as ArmS*;
+            Scope* arm = scope_new(s);
+            check_pat_variant(am.pat);
+            check_pattern(arm, am.pat);
+            if (am.guard != null) {
+                check_expr(arm, am.guard);
+            }
+            check_stmts(arm, am.bs, null);
+            i = i + 1;
+        }
+    } else if (st.kind == X_ST_WHILE) {
+        if (st.cond_ex != null) {
+            check_expr(s, st.cond_ex);
+        } else {
+            check_expr(s, st.cond);
+        }
+        Scope* inner = scope_new(s);
+        check_stmts(inner, st.then_s, st.then_t);
+    } else if (st.kind == X_ST_FOR_C) {
+        Scope* loop = scope_new(s);
+        if (!st.for_init_empty) {
+            if (st.for_init_is_decl) {
+                Stmt* d = st.for_init_decl;
+                mut u64 i = 0;
+                while (i < vlen(d.names)) {
+                    check_expr(loop, vec_get(d.inits, i) as Expr*);
+                    char* nm = vec_get(d.names, i) as char*;
+                    scope_add(loop, nm, d.is_mut, false);
+                    i = i + 1;
+                }
+            } else if (st.for_init_simple != null && st.for_init_simple.has_assign) {
+                check_mut_assign(loop, st.for_init_simple.e1);
+                check_expr(loop, st.for_init_simple.e2);
+            } else if (st.for_init_simple != null) {
+                check_expr(loop, st.for_init_simple.e1);
+            }
+        }
+        if (st.has_for_cond) {
+            check_expr(loop, st.for_cond);
+        }
+        if (st.has_incr) {
+            if (st.for_incr.has_assign) {
+                check_mut_assign(loop, st.for_incr.e1);
+                check_expr(loop, st.for_incr.e2);
+            } else {
+                check_expr(loop, st.for_incr.e1);
+            }
+        }
+        Scope* body = scope_new(loop);
+        check_stmts(body, st.then_s, st.then_t);
+    } else if (st.kind == X_ST_RETURN) {
+        if (st.has_ret) {
+            check_expr(s, st.ret_e);
+        }
+    }
+    return;
+}
+
+fn sema_find_adt(char* nm) -> Item* {
+    Vec* items = g_items as Vec*;
+    mut u64 i = 0;
+    while (i < vlen(items)) {
+        Item* it = vec_get(items, i) as Item*;
+        if (it.kind == X_IT_STRUCT && it.sname != null && tk_streq(it.sname, nm)) {
+            return it;
+        }
+        if (it.kind == X_IT_ENUM && it.ename != null && tk_streq(it.ename, nm)) {
+            return it;
+        }
+        i = i + 1;
+    }
+    return null;
+}
+
+fn type_reaches_cycle(Type* t, mut Vec* path) -> bool {
+    if (t == null) {
+        return false;
+    }
+    if (t.stars > 0 || t.is_ref) {
+        return false;
+    }
+    if (t.kind == X_TY_PRIM || t.kind == X_TY_AUTO || t.kind == X_TY_FN || t.kind == X_TY_DYN) {
+        return false;
+    }
+    if (t.kind == X_TY_TUPLE || t.kind == X_TY_ARRAY) {
+        return false;
+    }
+    if (t.kind == X_TY_PATH) {
+        if (vlen(t.path) == 1) {
+            char* s0 = vec_get(t.path, 0) as char*;
+            if (tk_streq(s0, "List") && vlen(t.gargs) == 1) {
+                return false;
+            }
+        }
+        if (vlen(t.path) != 1) {
+            return false;
+        }
+        char* nm = vec_get(t.path, 0) as char*;
+        mut u64 i = 0;
+        while (i < vlen(path)) {
+            char* q = vec_get(path, i) as char*;
+            if (tk_streq(q, nm)) {
+                return true;
+            }
+            i = i + 1;
+        }
+        Item* it = sema_find_adt(nm);
+        if (it == null) {
+            return false;
+        }
+        if (vlen(path) >= 64) {
+            return true;
+        }
+        path = vpush(path, nm as u8*);
+        mut bool bad = false;
+        if (it.kind == X_IT_STRUCT) {
+            i = 0;
+            while (i < vlen(it.fields) && !bad) {
+                SFld* ff = vec_get(it.fields, i) as SFld*;
+                bad = type_reaches_cycle(ff.ty, path);
+                i = i + 1;
+            }
+        } else if (it.kind == X_IT_ENUM) {
+            i = 0;
+            while (i < vlen(it.vars) && !bad) {
+                Variant* vv = vec_get(it.vars, i) as Variant*;
+                if (vv.has_tuple) {
+                    mut u64 k = 0;
+                    while (k < vlen(vv.ts) && !bad) {
+                        bad = type_reaches_cycle(vec_get(vv.ts, k) as Type*, path);
+                        k = k + 1;
+                    }
+                }
+                if (vv.has_struct) {
+                    mut u64 k = 0;
+                    while (k < vlen(vv.fs) && !bad) {
+                        SFld* vf = vec_get(vv.fs, k) as SFld*;
+                        bad = type_reaches_cycle(vf.ty, path);
+                        k = k + 1;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        if (vlen(path) > 0) {
+            path.len = path.len - 1;
+        }
+        return bad;
+    }
+    return false;
+}
+
+fn sema_check(Vec* items) -> i32 {
+    g_serr = 0;
+    g_items = items as u64;
+    Scope* glob = scope_new(null as Scope*);
+    mut u64 i = 0;
+    while (i < vlen(items)) {
+        Item* it = vec_get(items, i) as Item*;
+        if (it.kind == X_IT_FN) {
+            scope_add(glob, it.fn_name, false, false);
+        } else if (it.kind == X_IT_EXTERN) {
+            scope_add(glob, it.fn_name, false, false);
+        } else if (it.kind == X_IT_GLOBAL) {
+            Stmt* d = it.gdecl;
+            mut u64 j = 0;
+            while (j < vlen(d.names)) {
+                char* nm = vec_get(d.names, j) as char*;
+                scope_add(glob, nm, d.is_mut, false);
+                j = j + 1;
+            }
+        } else if (it.kind == X_IT_STRUCT) {
+            scope_add(glob, it.sname, false, false);
+        } else if (it.kind == X_IT_ENUM) {
+            scope_add(glob, it.ename, false, false);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < vlen(items)) {
+        Item* it = vec_get(items, i) as Item*;
+        if (it.kind == X_IT_FN && !it.is_proto) {
+            Scope* fnscope = scope_new(glob);
+            mut u64 j = 0;
+            while (j < vlen(it.params)) {
+                Param* pp = vec_get(it.params, j) as Param*;
+                mut bool isr = false;
+                if (pp.ty != null && pp.ty.is_ref) {
+                    isr = true;
+                }
+                scope_add(fnscope, pp.nm, pp.is_mut, isr);
+                j = j + 1;
+            }
+            check_stmts(fnscope, it.body, it.trail);
+        } else if (it.kind == X_IT_GLOBAL) {
+            Stmt* d = it.gdecl;
+            check_expr(glob, vec_get(d.inits, 0) as Expr*);
+        } else if (it.kind == X_IT_ENUM) {
+            mut bool has_pay = false;
+            mut bool has_disc = false;
+            mut u64 j = 0;
+            while (j < vlen(it.vars)) {
+                Variant* vv = vec_get(it.vars, j) as Variant*;
+                if (vv.has_tuple || vv.has_struct) {
+                    has_pay = true;
+                }
+                if (vv.has_disc) {
+                    has_disc = true;
+                }
+                j = j + 1;
+            }
+            if (has_pay && has_disc) {
+                serr("enum payload and '= const' never coexist", it.ename);
+            }
+            mut Vec* path = vec_new();
+            path = vpush(path, it.ename as u8*);
+            mut bool bad = false;
+            j = 0;
+            while (j < vlen(it.vars) && !bad) {
+                Variant* vv = vec_get(it.vars, j) as Variant*;
+                if (vv.has_tuple) {
+                    mut u64 k = 0;
+                    while (k < vlen(vv.ts) && !bad) {
+                        bad = type_reaches_cycle(vec_get(vv.ts, k) as Type*, path);
+                        k = k + 1;
+                    }
+                }
+                if (vv.has_struct) {
+                    mut u64 k = 0;
+                    while (k < vlen(vv.fs) && !bad) {
+                        SFld* vf = vec_get(vv.fs, k) as SFld*;
+                        bad = type_reaches_cycle(vf.ty, path);
+                        k = k + 1;
+                    }
+                }
+                j = j + 1;
+            }
+            if (bad) {
+                serr("enum contains itself by value (infinite size)", it.ename);
+            }
+        } else if (it.kind == X_IT_STRUCT) {
+            mut Vec* path = vec_new();
+            path = vpush(path, it.sname as u8*);
+            mut bool bad = false;
+            mut u64 j = 0;
+            while (j < vlen(it.fields) && !bad) {
+                SFld* ff = vec_get(it.fields, j) as SFld*;
+                bad = type_reaches_cycle(ff.ty, path);
+                j = j + 1;
+            }
+            if (bad) {
+                serr("struct contains itself by value (infinite size)", it.sname);
+            }
+        }
+        i = i + 1;
+    }
+    if (g_serr != 0) {
+        return 1;
+    }
+    return 0;
+}

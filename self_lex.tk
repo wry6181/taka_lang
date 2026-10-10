@@ -11,6 +11,9 @@ extern fn tk_sview(char* p, u64 n) -> sview;
 extern fn tk_sview_u8(u8* p, u64 n) -> sview;
 extern fn tk_argc() -> i32;
 extern fn tk_argv(i32 i) -> char*;
+extern fn tk_strlen(char* s) -> u64;
+extern fn tk_eprint(u8* p, u64 n);
+extern fn tk_set_exit(i32 c);
 
 struct Arena { u8* buf, u64 cap, u64 pos, }
 
@@ -523,6 +526,9 @@ fn main() {
     Arena ar = arena_mk(mem, 1048576);
     u8* f = tk_fopen(path, "r");
     if (f == null) {
+        tk_eprint(path as u8*, tk_strlen(path));
+        tk_eprint(": No such file or directory\n" as u8*, 28);
+        tk_set_exit(1);
         return;
     }
     tk_fseek(f, 0, 2);

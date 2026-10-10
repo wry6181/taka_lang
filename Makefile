@@ -1,6 +1,6 @@
 CC = cc
 CFLAGS = -Wall -Wextra -g
-SRC = lexer.c parser.c arena.c ast_build.c sema.c cgen.c x64.c
+SRC = lexer.c parser.c arena.c ast_build.c ast_dump.c sema.c cgen.c x64.c
 HDR = lexer.h types.h arena.h ast.h ast_build.h sema.h cgen.h x64.h taka_runtime.h ds_list.h ds_map.h ds_set.h
 
 all: taka
@@ -113,6 +113,71 @@ lexdiff: taka
 		diff /tmp/taka-lex-c.txt /tmp/taka-lex-tn.txt || exit 1; \
 	done
 	rm -f /tmp/taka-lexdump /tmp/taka-selflex-c /tmp/taka-selflex-n
+
+# stage-2 self-host check: taka parser must match the C builder byte-for-byte
+sexpdiff: taka
+	./taka build self_parse.tk -o /tmp/taka-selfparse-c || exit 1
+	./taka --backend=native build self_parse.tk -o /tmp/taka-selfparse-n || exit 1
+	for f in *.tk; do \
+		./taka sexp $$f > /tmp/taka-sx-c.txt 2>&1; \
+		test $$? -le 1 || exit 1; \
+		/tmp/taka-selfparse-c $$f > /tmp/taka-sx-tc.txt 2>&1; \
+		test $$? -le 1 || exit 1; \
+		/tmp/taka-selfparse-n $$f > /tmp/taka-sx-tn.txt 2>&1; \
+		test $$? -le 1 || exit 1; \
+		diff /tmp/taka-sx-c.txt /tmp/taka-sx-tc.txt || exit 1; \
+		diff /tmp/taka-sx-c.txt /tmp/taka-sx-tn.txt || exit 1; \
+	done
+	rm -f /tmp/taka-selfparse-c /tmp/taka-selfparse-n
+
+# stage-3 self-host check: taka checker must match C sema (verdict+messages)
+checkdiff: taka
+	./taka build self_parse.tk -o /tmp/taka-selfcheck-c || exit 1
+	./taka --backend=native build self_parse.tk -o /tmp/taka-selfcheck-n || exit 1
+	for f in *.tk; do \
+		./taka check $$f > /tmp/taka-ck-c.txt 2>&1; \
+		test $$? -le 1 || exit 1; \
+		/tmp/taka-selfcheck-c $$f --check > /tmp/taka-ck-tc.txt 2>&1; \
+		test $$? -le 1 || exit 1; \
+		/tmp/taka-selfcheck-n $$f --check > /tmp/taka-ck-tn.txt 2>&1; \
+		test $$? -le 1 || exit 1; \
+		diff /tmp/taka-ck-c.txt /tmp/taka-ck-tc.txt || exit 1; \
+		diff /tmp/taka-ck-c.txt /tmp/taka-ck-tn.txt || exit 1; \
+	done
+	rm -f /tmp/taka-selfcheck-c /tmp/taka-selfcheck-n
+
+# full self-host closure: .tk -> binary using only self-hosted stages.
+# Stage binaries are built natively (no C involved); cc is only the assembler.
+selfhost: taka
+	./taka --backend=native build self_parse.tk -o /tmp/taka-stage-parse || exit 1
+	./taka --backend=native build self_emit.tk -o /tmp/taka-stage-emit || exit 1
+	/tmp/taka-stage-parse demo.tk > /tmp/taka-sh.sexp || exit 1
+	/tmp/taka-stage-emit /tmp/taka-sh.sexp /tmp/taka-sh.s || exit 1
+	cc /tmp/taka-sh.s -o /tmp/taka-sh-bin || exit 1
+	/tmp/taka-sh-bin > /tmp/taka-sh-out.txt || exit 1
+	printf '30\n10\n0\n' > /tmp/taka-sh.want
+	diff /tmp/taka-sh.want /tmp/taka-sh-out.txt || exit 1
+	rm -f /tmp/taka-stage-parse /tmp/taka-stage-emit
+
+# stage-4 self-host check: taka emitter must match C x64_emit byte-for-byte
+emitdiff: taka file_fixture.txt
+	./taka build self_emit.tk -o /tmp/taka-selfemit-c || exit 1
+	./taka --backend=native build self_emit.tk -o /tmp/taka-selfemit-n || exit 1
+	for f in demo enum_test scope_test list_test str_test file_test map_test args_test torture; do \
+		./taka sexp $$f.tk > /tmp/taka-sx.txt 2>&1 || exit 1; \
+		./taka --backend=native $$f.tk >/dev/null 2>&1 || exit 1; \
+		mv $$f.s /tmp/taka-emit-ref.s; \
+		/tmp/taka-selfemit-c /tmp/taka-sx.txt /tmp/taka-emit-tc.s || exit 1; \
+		/tmp/taka-selfemit-n /tmp/taka-sx.txt /tmp/taka-emit-tn.s || exit 1; \
+		diff /tmp/taka-emit-ref.s /tmp/taka-emit-tc.s || exit 1; \
+		diff /tmp/taka-emit-ref.s /tmp/taka-emit-tn.s || exit 1; \
+		cc /tmp/taka-emit-tc.s -o /tmp/taka-emit-run || exit 1; \
+		cc /tmp/taka-emit-ref.s -o /tmp/taka-emit-ref || exit 1; \
+		/tmp/taka-emit-run > /tmp/taka-emit-out.txt 2>&1 || exit 1; \
+		/tmp/taka-emit-ref > /tmp/taka-emit-ref.txt 2>&1 || exit 1; \
+		diff /tmp/taka-emit-out.txt /tmp/taka-emit-ref.txt || exit 1; \
+	done
+	rm -f /tmp/taka-selfemit-c /tmp/taka-selfemit-n
 
 run-demo: demo
 	./demo

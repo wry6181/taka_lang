@@ -1,0 +1,8 @@
+extern fn tk_print_i32(i32 x);
+
+fn main() {
+    i32 a = 1;
+    a = 2;
+    tk_print_i32(a);
+    return;
+}
