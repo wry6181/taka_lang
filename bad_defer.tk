@@ -1,0 +1,6 @@
+extern fn tk_print_i32(i32 x);
+
+fn bad() {
+    defer { return; }
+    tk_print_i32(0);
+}

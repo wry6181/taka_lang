@@ -251,6 +251,8 @@ static const char *assign_op_str(TokenKind k){
 
 // ---- match support: enum table + pattern conditions/bindings ----
 static int cg_failed = 0;
+static int cg_used_defer = 0; // set when a nested __defer_ fn is emitted (needs execstack)
+int cgen_needs_execstack(void) { return cg_used_defer; }
 static void cg_err(const char *msg) { fprintf(stderr, "codegen error: %s\n", msg); cg_failed = 1; }
 
 static CgEnum *cg_enums = NULL; static int cg_enum_n = 0;
@@ -402,6 +404,9 @@ static void collect_stmts(TkStmt **ss, int n) {
                 break;
             case TK_ST_LABEL: { TkStmt *inner[1] = {s->lab_s}; collect_stmts(inner, 1); break; }
             case TK_ST_SPAWN_BLK: collect_stmts(s->sp_blk, s->sp_n); break;
+            case TK_ST_DEFER:
+                if (s->defer_is_block) collect_stmts(s->defer_blk, s->defer_n);
+                break;
             default: break;
         }
     }
@@ -544,7 +549,7 @@ static void emit_pat_lit(TkPattern *p) {
 static void emit_alt_cond(TkPattern *p, int id) {
     switch (p->kind) {
         case TK_PAT_WILD: case TK_PAT_BIND: fprintf(out, "1"); break;
-        case TK_PAT_REF: cg_err("ref patterns (&x) TODO in core backend"); fprintf(out, "0"); break;
+        case TK_PAT_REF: fprintf(out, "1"); break;
         case TK_PAT_LIT: fprintf(out, "(__m%d == ", id); emit_pat_lit(p); fprintf(out, ")"); break;
         case TK_PAT_PATH: {
             if (p->path.count != 2) { cg_err("qualified Enum::Variant needed in core patterns"); fprintf(out, "0"); break; }
@@ -560,13 +565,13 @@ static void emit_alt_cond(TkPattern *p, int id) {
                     for (int i = 0; i < p->acount; i++) {
                         TkPattern *a = p->args[i];
                         if (a->kind == TK_PAT_LIT) { fprintf(out, " && (__m%d.u.%s._%d == ", id, en->vars[vi].vn, i); emit_pat_lit(a); fprintf(out, ")"); }
-                        else if (a->kind != TK_PAT_BIND && a->kind != TK_PAT_WILD) cg_err("nested patterns TODO in core backend");
+                        else if (a->kind != TK_PAT_BIND && a->kind != TK_PAT_WILD && a->kind != TK_PAT_REF) cg_err("nested patterns TODO in core backend");
                     }
                 } else if (en->vars[vi].kind == 2) {
                     for (int i = 0; i < p->fcount; i++) {
                         TkPattern *sp = p->fields[i].pat;
                         if (sp && sp->kind == TK_PAT_LIT) { fprintf(out, " && (__m%d.u.%s.%s == ", id, en->vars[vi].vn, p->fields[i].field); emit_pat_lit(sp); fprintf(out, ")"); }
-                        else if (!sp || (sp->kind != TK_PAT_BIND && sp->kind != TK_PAT_WILD)) cg_err("nested patterns TODO in core backend");
+                        else if (!sp || (sp->kind != TK_PAT_BIND && sp->kind != TK_PAT_WILD && sp->kind != TK_PAT_REF)) cg_err("nested patterns TODO in core backend");
                     }
                 }
                 fprintf(out, ")");
@@ -583,6 +588,11 @@ static void emit_pat_binds(TkPattern *p, int id, int indent) {
         cg_var_add(p->name, NULL); // whole-scrutinee type unknown in core; no List lowering
         return;
     }
+    if (p->kind == TK_PAT_REF) {
+        ind(indent); fprintf(out, "__auto_type %s = &__m%d;\n", p->name, id);
+        cg_var_add(p->name, NULL);
+        return;
+    }
     if (p->kind != TK_PAT_PATH || p->path.count != 2) return;
     CgEnum *en = cg_find_enum(p->path.segs[0].seg);
     if (!en || !en->payload) return;
@@ -593,6 +603,10 @@ static void emit_pat_binds(TkPattern *p, int id, int indent) {
             if (p->args[i]->kind == TK_PAT_BIND) {
                 ind(indent); fprintf(out, "__auto_type %s = __m%d.u.%s._%d;\n", p->args[i]->name, id, en->vars[vi].vn, i);
                 cg_var_add(p->args[i]->name, en->vars[vi].tuple_types ? en->vars[vi].tuple_types[i] : NULL);
+            } else if (p->args[i]->kind == TK_PAT_REF) {
+                ind(indent); fprintf(out, "__auto_type %s = &__m%d.u.%s._%d;\n", p->args[i]->name, id, en->vars[vi].vn, i);
+                TkType *ft = en->vars[vi].tuple_types ? en->vars[vi].tuple_types[i] : NULL;
+                cg_var_add(p->args[i]->name, copy_ty_star(ft, 1));
             }
     } else if (en->vars[vi].kind == 2) {
         for (int i = 0; i < p->fcount; i++)
@@ -602,6 +616,12 @@ static void emit_pat_binds(TkPattern *p, int id, int indent) {
                 for (int j = 0; j < en->vars[vi].sfn; j++)
                     if (strcmp(en->vars[vi].sfields[j], p->fields[i].field) == 0) { ft = en->vars[vi].sfield_types[j]; break; }
                 cg_var_add(p->fields[i].pat->name, ft);
+            } else if (p->fields[i].pat && p->fields[i].pat->kind == TK_PAT_REF) {
+                ind(indent); fprintf(out, "__auto_type %s = &__m%d.u.%s.%s;\n", p->fields[i].pat->name, id, en->vars[vi].vn, p->fields[i].field);
+                TkType *ft = NULL;
+                for (int j = 0; j < en->vars[vi].sfn; j++)
+                    if (strcmp(en->vars[vi].sfields[j], p->fields[i].field) == 0) { ft = en->vars[vi].sfield_types[j]; break; }
+                cg_var_add(p->fields[i].pat->name, copy_ty_star(ft, 1));
             }
     }
 }
@@ -642,6 +662,14 @@ static void emit_block_body(TkStmt **ss,int n,TkExpr *trail,int indent){
     for(int i=0;i<n;i++) emit_stmt(ss[i],indent);
     if(trail){ ind(indent); emit_expr(trail); fprintf(out,";\n"); }
     cg_scope_pop();
+}
+
+// True defer: per-function registration stack of nested GNU-C fns, drained
+// LIFO at every return and at function end. Slots are emitted unconditionally
+// (unused attribute keeps -Wall clean) so defers nested in block values work.
+static void emit_defer_drain(int indent) {
+    ind(indent); fprintf(out, "while (__dlen) ((void(*)())__dbuf[--__dlen])();\n");
+    ind(indent); fprintf(out, "free(__dbuf);\n");
 }
 
 static void emit_stmt(TkStmt *s,int indent){
@@ -754,7 +782,15 @@ static void emit_stmt(TkStmt *s,int indent){
             }
             ind(indent);fprintf(out,"}\n"); break;
         }
-        case TK_ST_DEFER: ind(indent);fprintf(out,"/*defer-stub*/ "); if(s->defer_is_block) emit_block_body(s->defer_blk,s->defer_n,s->defer_t,0); else { emit_expr(s->defer_simple->e1); if(s->defer_simple->has_assign){fprintf(out,"%s",assign_op_str(s->defer_simple->assign_op));emit_expr(s->defer_simple->e2);} fprintf(out,";"); } fprintf(out,"\n"); break;
+        case TK_ST_DEFER: {
+            int id = tmp_n++;
+            cg_used_defer = 1;            ind(indent); fprintf(out, "void __defer_%d(void) {\n", id);
+            if (s->defer_is_block) emit_block_body(s->defer_blk, s->defer_n, s->defer_t, indent+1);
+            else { ind(indent+1); emit_expr(s->defer_simple->e1); if (s->defer_simple->has_assign) { fprintf(out, "%s", assign_op_str(s->defer_simple->assign_op)); emit_expr(s->defer_simple->e2); } fprintf(out, ";\n"); }
+            ind(indent); fprintf(out, "}\n");
+            ind(indent); fprintf(out, "{ if (__dlen == __dcap) { __dcap = __dcap ? __dcap * 2 : 4; __dbuf = realloc(__dbuf, __dcap * sizeof(void*)); if (!__dbuf) { fprintf(stderr, \"OOM in defer\\n\"); exit(1); } } __dbuf[__dlen++] = (void*)__defer_%d; }\n", id);
+            break;
+        }
         case TK_ST_BREAK: ind(indent);fprintf(out,"break;\n"); break;
         case TK_ST_CONTINUE: ind(indent);fprintf(out,"continue;\n"); break;
         case TK_ST_RETURN:
@@ -764,10 +800,17 @@ static void emit_stmt(TkStmt *s,int indent){
                 ind(indent); emit_type(cg_cur_ret); fprintf(out, " __ret%d = {0};\n", rid);
                 char tgt[64]; snprintf(tgt, sizeof tgt, "__ret%d", rid);
                 emit_match_value(s->ret_e, tgt, indent);
+                emit_defer_drain(indent);
                 ind(indent); fprintf(out, "return __ret%d;\n", rid);
                 break;
             }
-            ind(indent);fprintf(out,"return"); if(s->has_ret){fprintf(out," ");emit_expr(s->ret_e);} fprintf(out,";\n"); break;
+            if (s->has_ret) {
+                ind(indent); fprintf(out, "{ __auto_type __rv = ("); emit_expr(s->ret_e); fprintf(out, "); ");
+                fprintf(out, "while (__dlen) ((void(*)())__dbuf[--__dlen])(); free(__dbuf); return __rv; }\n");
+            } else {
+                ind(indent); fprintf(out, "{ while (__dlen) ((void(*)())__dbuf[--__dlen])(); free(__dbuf); return; }\n");
+            }
+            break;
         case TK_ST_LABEL: ind(indent);fprintf(out,"%s: ",s->lab); emit_stmt(s->lab_s,indent); break;
         case TK_ST_SPAWN_BLK: ind(indent);fprintf(out,"{\n"); emit_block_body(s->sp_blk,s->sp_n,s->sp_t,indent+1); ind(indent);fprintf(out,"}\n"); break;
         case TK_ST_SPAWN_CALL: ind(indent);emit_expr(s->sp_call);fprintf(out,";\n"); break;
@@ -807,6 +850,7 @@ static int item_needs_list_first(TkItem *it) {
 }
 int cgen_emit(TkProgram *prog, const char *out_path) {
     cg_failed = 0;
+    cg_used_defer = 0;
     cg_build_enums(prog);
     free(cg_list_elems); cg_list_elems = NULL; cg_list_n = 0; cg_list_cap = 0;
     cg_var_n = 0; cg_var_fn_base = 0; cg_depth = 0;
@@ -964,7 +1008,12 @@ int cgen_emit(TkProgram *prog, const char *out_path) {
             fprintf(out," %s(",strcmp(it->fn_name,"main")==0?"taka_main":it->fn_name);
             for(int j=0;j<it->pcount;j++){if(j)fprintf(out,",");emit_type(it->params[j].ty);fprintf(out," %s",it->params[j].nm);}
             if(it->pcount==0) fprintf(out,"void");
-            fprintf(out,"){\n"); emit_block_body(it->body,it->bcount,it->trail,1);
+            fprintf(out,"){\n");
+            ind(1); fprintf(out, "__attribute__((unused)) void **__dbuf = NULL;\n");
+            ind(1); fprintf(out, "__attribute__((unused)) size_t __dlen = 0, __dcap = 0;\n");
+            emit_block_body(it->body,it->bcount,it->trail,1);
+            // drain defers on fallthrough (explicit returns drain at their own sites)
+            emit_defer_drain(1);
             // void fallthrough: C requires return for non-void; core demo uses explicit returns
             fprintf(out,"}\n");
         } else if(it->kind==TK_IT_TRAIT||it->kind==TK_IT_IMPL||it->kind==TK_IT_EFFECT||it->kind==TK_IT_HANDLER){

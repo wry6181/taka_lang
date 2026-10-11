@@ -234,6 +234,9 @@ static int loop_brk[64], loop_cont[64], loop_n = 0;
 static TkType *x_cur_ret_ty = NULL;
 static int x_sret_home = -1;
 static int x_fn_exit = 0;
+// defer-chain head slot (reserved per function in emit_fn; NULL = empty).
+// Chain nodes are 16B malloc cells { next:0, fn:8 }; drained LIFO at .Lfn.
+static int x_defer_head = -1;
 // shared statement-list emitter
 static void emit_stmts(TkStmt **ss, int n) {
     for (int i = 0; i < n; i++) emit_stmt(ss[i]);
@@ -402,6 +405,14 @@ static TkType *xnew_path1(const char *seg) {
     t->path.segs[0].seg = (char *)seg;
     return t;
 }
+// copy a type with adjusted pointer depth (for &pat bindings)
+static TkType *copy_ty_star(TkType *t, int dstar) {
+    if (!t) return NULL;
+    TkType *n = calloc(1, sizeof *n);
+    if (!n) return NULL;
+    *n = *t; n->stars += dstar;
+    return n;
+}
 static TkType *xinfer(TkExpr *e);
 static TkType *xinfer(TkExpr *e) {
     if (!e) return NULL;
@@ -475,7 +486,7 @@ static TkType *xinfer(TkExpr *e) {
         case TK_EX_INDEX: {
             TkType *bt = xinfer(e->callee);
             if (!bt) return NULL;
-            if (bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1)
+            if (bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1 && bt->stars == 0 && !bt->is_ref)
                 return bt->gargs[0];
             if (bt->kind == TK_TY_ARRAY) return bt->elem;
             if (bt->stars > 0) {
@@ -668,9 +679,11 @@ static void emit_assign_combine(TokenKind op, QW lw) {
         else if (lw == Q_I32) fprintf(o, "    movslq (%%rcx), %%rax\n");
         else if (lw == Q_U32) fprintf(o, "    movl (%%rcx), %%eax\n");
         else fprintf(o, "    movq (%%rcx), %%rax\n");
+        fprintf(o, "    pushq %%rcx\n"); // spill addr: movb below clobbers %%cl (low byte of %%rcx)
         fprintf(o, "    movb %%dl, %%cl\n");
         if (op == TOKEN_SHL_EQ) fprintf(o, is64 ? "    shlq %%cl, %%rax\n" : "    shll %%cl, %%eax\n");
         else fprintf(o, is64 ? (uns ? "    shrq %%cl, %%rax\n" : "    sarq %%cl, %%rax\n") : (uns ? "    shrl %%cl, %%eax\n" : "    sarl %%cl, %%eax\n"));
+        fprintf(o, "    popq %%rcx\n"); // restore addr
         if (is64) fprintf(o, "    movq %%rax, (%%rcx)\n");
         else fprintf(o, "    movl %%eax, (%%rcx)\n");
         return;
@@ -868,7 +881,7 @@ static void emit_addr(TkExpr *e) {
             // pointer/ref base: index the loaded pointer (see FIELD auto-deref above)
             if (bt && (bt->stars > 0 || bt->is_ref)) emit_val(e->callee);
             else emit_addr(e->callee);
-            if (bt && bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1)
+            if (bt && bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1 && bt->stars == 0 && !bt->is_ref)
                 fprintf(o, "    movq (%%rax), %%rax\n"); // List base -> data pointer (offset 0)
             fprintf(o, "    pushq %%rax\n");
             emit_val(e->index);
@@ -1260,14 +1273,12 @@ static void emit_val(TkExpr *e) {
                     break;
                 }
                 case TOKEN_SHL:
-                    fprintf(o, "    movq %%rax, %%rdx\n    movq %%rcx, %%rax\n    movq %%rdx, %%rcx\n");
                     if (!strcmp(suf, "q")) fprintf(o, "    shlq %%cl, %%rax\n");
                     else fprintf(o, "    shll %%cl, %%eax\n");
                     break;
                 case TOKEN_SHR: {
                     // logical for unsigned, arithmetic for signed (by LHS)
                     int uns = (lw == Q_U64 || lw == Q_U32 || lw == Q_U16 || lw == Q_U8);
-                    fprintf(o, "    movq %%rax, %%rdx\n    movq %%rcx, %%rax\n    movq %%rdx, %%rcx\n");
                     if (!strcmp(suf, "q")) fprintf(o, uns ? "    shrq %%cl, %%rax\n" : "    sarq %%cl, %%rax\n");
                     else fprintf(o, uns ? "    shrl %%cl, %%eax\n" : "    sarl %%cl, %%eax\n");
                     break;
@@ -1408,9 +1419,17 @@ static void emit_val(TkExpr *e) {
         case TK_EX_ARRAY_LIST:
             Xerr("array literal needs List<T> or [T; N] context in core");
             break;
-        case TK_EX_BRACE: case TK_EX_BLOCK: case TK_EX_LAMBDA: case TK_EX_IF:
+        case TK_EX_BRACE: case TK_EX_LAMBDA: case TK_EX_IF:
             Xerr("block/lambda/if values TODO in core backend");
             break;
+        case TK_EX_BLOCK: {
+            xv_push();
+            emit_stmts(e->stmts, e->scount2);
+            if (e->trailing) emit_val(e->trailing);
+            else { Xerr("block value needs trailing expression"); }
+            xv_pop();
+            break;
+        }
         case TK_EX_CALL: emit_call(e); break;
         default: Xerr("emit_val TODO for this expression"); break;
     }
@@ -1530,6 +1549,62 @@ static void arg_home(int i, TkType *formal, int *ipos, int *fpos, int *spos, int
 }
 
 static void emit_call(TkExpr *e);
+static int expr_may_call(TkExpr *e);
+// true if evaluating s may execute a call (conservative scan for blocks
+// used as call arguments); over-approximation only costs temps.
+static int stmt_may_call(TkStmt *s) {
+    if (!s) return 0;
+    switch (s->kind) {
+        case TK_ST_DECL: {
+            for (int i = 0; i < s->dcount; i++) if (expr_may_call(s->inits[i])) return 1;
+            return 0;
+        }
+        case TK_ST_SIMPLE:
+            if (expr_may_call(s->e1)) return 1;
+            return s->has_assign && expr_may_call(s->e2);
+        case TK_ST_BLOCK: {
+            for (int i = 0; i < s->n; i++) if (stmt_may_call(s->stmts[i])) return 1;
+            return expr_may_call(s->trailing);
+        }
+        case TK_ST_IF: {
+            if (expr_may_call(s->cond_ex ? s->cond_ex : s->cond)) return 1;
+            for (int i = 0; i < s->then_n; i++) if (stmt_may_call(s->then_s[i])) return 1;
+            for (int i = 0; i < s->eif_n; i++) {
+                if (expr_may_call(s->eifs[i].e ? s->eifs[i].e : s->eifs[i].c)) return 1;
+                for (int j = 0; j < s->eifs[i].n; j++) if (stmt_may_call(s->eifs[i].s[j])) return 1;
+            }
+            if (s->has_els) for (int i = 0; i < s->els_n; i++) if (stmt_may_call(s->els[i])) return 1;
+            return 0;
+        }
+        case TK_ST_WHILE:
+            if (expr_may_call(s->cond_ex ? s->cond_ex : s->cond)) return 1;
+            for (int i = 0; i < s->then_n; i++) if (stmt_may_call(s->then_s[i])) return 1;
+            return 0;
+        case TK_ST_FOR_C: {
+            if (!s->for_init_empty) {
+                if (s->for_init_is_decl) {
+                    for (int i = 0; i < s->for_init_decl->dcount; i++)
+                        if (expr_may_call(s->for_init_decl->inits[i])) return 1;
+                } else if (stmt_may_call(s->for_init_simple)) return 1;
+            }
+            if (s->has_for_cond && expr_may_call(s->for_cond)) return 1;
+            if (s->has_incr && stmt_may_call(s->for_incr)) return 1;
+            for (int i = 0; i < s->then_n; i++) if (stmt_may_call(s->then_s[i])) return 1;
+            return 0;
+        }
+        case TK_ST_MATCH_STMT: {
+            if (expr_may_call(s->m_scrut)) return 1;
+            for (int i = 0; i < s->m_arm_n; i++) {
+                if (s->m_arms[i].guard && expr_may_call(s->m_arms[i].guard)) return 1;
+                for (int j = 0; j < s->m_arms[i].bn; j++) if (stmt_may_call(s->m_arms[i].bs[j])) return 1;
+            }
+            return 0;
+        }
+        case TK_ST_RETURN:
+            return s->has_ret && expr_may_call(s->ret_e);
+        default: return 0;
+    }
+}
 // true if evaluating e may execute a call (which reuses the shared argtmp
 // area); call args containing calls are staged through private temps.
 static int expr_may_call(TkExpr *e) {
@@ -1549,6 +1624,11 @@ static int expr_may_call(TkExpr *e) {
             return expr_may_call(e->lhs) || expr_may_call(e->rhs);
         case TK_EX_TERNARY:
             return expr_may_call(e->cond) || expr_may_call(e->then_e) || expr_may_call(e->else_e);
+        case TK_EX_BLOCK: {
+            for (int i = 0; i < e->scount2; i++)
+                if (stmt_may_call(e->stmts[i])) return 1;
+            return expr_may_call(e->trailing);
+        }
         case TK_EX_INDEX:
             return expr_may_call(e->callee) || expr_may_call(e->index);
         case TK_EX_FIELD:
@@ -1569,7 +1649,7 @@ static void emit_call(TkExpr *e) {
     // List push: `xs.push(v)` -> List_T_push(&base, v)
     if (e->callee && e->callee->kind == TK_EX_FIELD && !strcmp(e->callee->field, "push") && e->callee->callee) {
         TkType *bt = xinfer(e->callee->callee);
-        if (bt && bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1) {
+        if (bt && bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1 && bt->stars == 0 && !bt->is_ref) {
             if (e->nargs != 1) { Xerr("push takes exactly one arg"); return; }
             TkType *et = bt->gargs[0];
             QW ew = ty_width(et);
@@ -1830,9 +1910,12 @@ static void xbind_add(TkPattern *p, TkType *st) {
     if (!p) return;
     if (p->kind == TK_PAT_BIND || p->kind == TK_PAT_REF) {
         int slots = 1;
-        if (p->kind == TK_PAT_BIND && st && ty_width(st) == Q_STRUCT)
+        TkType *vt = st;
+        if (p->kind == TK_PAT_REF) {
+            vt = copy_ty_star(st, 1); // reference to scrutinee (NULL stays NULL)
+        } else if (st && ty_width(st) == Q_STRUCT)
             slots = slots_for_size(ty_size(st));
-        xv_add(p->name, st, slots);
+        xv_add(p->name, vt, slots);
         return;
     }
     if (p->kind != TK_PAT_PATH || p->path.count != 2) return;
@@ -1843,19 +1926,27 @@ static void xbind_add(TkPattern *p, TkType *st) {
     if (en->vars[vi].kind == 1) {
         for (int i = 0; i < p->acount; i++) {
             TkPattern *a = p->args[i];
-            if (a->kind != TK_PAT_BIND) continue;
+            if (a->kind != TK_PAT_BIND && a->kind != TK_PAT_REF) continue;
             TkType *ft = en->vars[vi].st[i];
-            xv_add(a->name, ft, slots_for_size(ty_size(ft)));
+            if (a->kind == TK_PAT_REF) {
+                xv_add(a->name, copy_ty_star(ft, 1), 1);
+            } else {
+                xv_add(a->name, ft, slots_for_size(ty_size(ft)));
+            }
         }
     } else if (en->vars[vi].kind == 2) {
         for (int i = 0; i < p->fcount; i++) {
             TkPattern *sp = p->fields[i].pat;
-            if (!sp || sp->kind != TK_PAT_BIND) continue;
+            if (!sp || (sp->kind != TK_PAT_BIND && sp->kind != TK_PAT_REF)) continue;
             TkType *ft = NULL;
             for (int j = 0; j < en->vars[vi].sfn; j++)
                 if (!strcmp(en->vars[vi].sf[j], p->fields[i].field)) ft = en->vars[vi].st[j];
             if (!ft) continue;
-            xv_add(sp->name, ft, slots_for_size(ty_size(ft)));
+            if (sp->kind == TK_PAT_REF) {
+                xv_add(sp->name, copy_ty_star(ft, 1), 1);
+            } else {
+                xv_add(sp->name, ft, slots_for_size(ty_size(ft)));
+            }
         }
     }
 }
@@ -1864,6 +1955,18 @@ static void xbind_add(TkPattern *p, TkType *st) {
 static void xbind_copy(TkPattern *p, int mslot, TkType *st) {
     char mm[64];
     mem_slot(mslot, mm, sizeof mm);
+    if (p->kind == TK_PAT_REF) {
+        // &x binds the address of the matched place
+        XV *v = xv_find(p->name);
+        if (!v) { Xerr("binding missing"); return; }
+        char dst[64];
+        mem_slot(v->slot, dst, sizeof dst);
+        fprintf(o, "    leaq %s, %%rax\n", mm);
+        char m[80];
+        snprintf(m, sizeof m, "%s", dst);
+        store_mem(m, Q_PTR);
+        return;
+    }
     if (p->kind == TK_PAT_BIND) {
         XV *v = xv_find(p->name);
         if (!v) { Xerr("binding missing"); return; }
@@ -1898,7 +2001,7 @@ static void xbind_copy(TkPattern *p, int mslot, TkType *st) {
     if (vi < 0) return;
     if (en->vars[vi].kind == 1) {
         for (int i = 0; i < p->acount; i++) {
-            if (p->args[i]->kind != TK_PAT_BIND) continue;
+            if (p->args[i]->kind != TK_PAT_BIND && p->args[i]->kind != TK_PAT_REF) continue;
             XV *v = xv_find(p->args[i]->name);
             if (!v) { Xerr("binding missing"); continue; }
             TkType *ft = en->vars[vi].st[i];
@@ -1906,6 +2009,15 @@ static void xbind_copy(TkPattern *p, int mslot, TkType *st) {
             int off = tuple_field_off(en, vi, i);
             char dst[64];
             mem_slot(v->slot, dst, sizeof dst);
+            if (p->args[i]->kind == TK_PAT_REF) {
+                // address of the member
+                fprintf(o, "    leaq %s, %%rax\n", mm);
+                if (off) fprintf(o, "    addq $%d, %%rax\n", off);
+                char m[80];
+                snprintf(m, sizeof m, "%s", dst);
+                store_mem(m, Q_PTR);
+                continue;
+            }
             if (fw == Q_STRUCT) {
                 int esz = ty_size(ft);
                 fprintf(o, "    leaq %s, %%rsi\n", mm);
@@ -1935,7 +2047,7 @@ static void xbind_copy(TkPattern *p, int mslot, TkType *st) {
     } else if (en->vars[vi].kind == 2) {
         for (int i = 0; i < p->fcount; i++) {
             TkPattern *sp = p->fields[i].pat;
-            if (!sp || sp->kind != TK_PAT_BIND) continue;
+            if (!sp || (sp->kind != TK_PAT_BIND && sp->kind != TK_PAT_REF)) continue;
             TkType *ft = NULL;
             for (int j = 0; j < en->vars[vi].sfn; j++)
                 if (!strcmp(en->vars[vi].sf[j], p->fields[i].field)) ft = en->vars[vi].st[j];
@@ -1946,6 +2058,15 @@ static void xbind_copy(TkPattern *p, int mslot, TkType *st) {
             if (!v) { Xerr("binding missing"); continue; }
             char dst[64];
             mem_slot(v->slot, dst, sizeof dst);
+            if (sp->kind == TK_PAT_REF) {
+                // address of the member
+                fprintf(o, "    leaq %s, %%rax\n", mm);
+                if (off) fprintf(o, "    addq $%d, %%rax\n", off);
+                char m[80];
+                snprintf(m, sizeof m, "%s", dst);
+                store_mem(m, Q_PTR);
+                continue;
+            }
             if (fw == Q_STRUCT) {
                 int esz = ty_size(ft);
                 fprintf(o, "    leaq %s, %%rsi\n", mm);
@@ -1983,11 +2104,8 @@ static void xalt_bool(TkPattern *p, int mslot, TkType *st) {
     switch (p->kind) {
         case TK_PAT_WILD:
         case TK_PAT_BIND:
-            fprintf(o, "    movb $1, %%al\n");
-            break;
         case TK_PAT_REF:
-            Xerr("ref patterns (&x) TODO in native backend");
-            fprintf(o, "    xorb %%al, %%al\n");
+            fprintf(o, "    movb $1, %%al\n");
             break;
         case TK_PAT_LIT: {
             if (p->tok.kind == TOKEN_TRUE) {
@@ -2068,7 +2186,7 @@ static void xalt_bool(TkPattern *p, int mslot, TkType *st) {
                             fprintf(o, "    sete %%cl\n");
                             fprintf(o, "    andb %%cl, (%%rsp)\n");
                             fprintf(o, "    popq %%rax\n");
-                        } else if (a->kind != TK_PAT_BIND && a->kind != TK_PAT_WILD) {
+                        } else if (a->kind != TK_PAT_BIND && a->kind != TK_PAT_WILD && a->kind != TK_PAT_REF) {
                             Xerr("nested patterns TODO in native backend");
                         }
                     }
@@ -2086,7 +2204,7 @@ static void xalt_bool(TkPattern *p, int mslot, TkType *st) {
                             fprintf(o, "    sete %%cl\n");
                             fprintf(o, "    andb %%cl, (%%rsp)\n");
                             fprintf(o, "    popq %%rax\n");
-                        } else if (!sp || (sp->kind != TK_PAT_BIND && sp->kind != TK_PAT_WILD)) {
+                        } else if (!sp || (sp->kind != TK_PAT_BIND && sp->kind != TK_PAT_WILD && sp->kind != TK_PAT_REF)) {
                             Xerr("nested patterns TODO in native backend");
                         }
                     }
@@ -2329,6 +2447,7 @@ static void xcollect_ty(TkType *t) {
 }
 static void walk_expr(TkExpr *e);
 static void walk_stmts(TkStmt **ss, int n);
+static void wt_pop(void);
 static void walk_match_tmps(TkExpr *m);
 static void walk_pat_types(TkPattern *p);
 static void walk_expr(TkExpr *e) {
@@ -2361,7 +2480,7 @@ static void walk_expr(TkExpr *e) {
             // (&list in rdi); reserve it (mirrors emit_call's push lowering).
             if (e->callee && e->callee->kind == TK_EX_FIELD && !strcmp(e->callee->field, "push") && e->callee->callee) {
                 TkType *bt = xinfer(e->callee->callee);
-                if (bt && bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1) {
+                if (bt && bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1 && bt->stars == 0 && !bt->is_ref) {
                     if (e->nargs + 1 > w_maxArgs) w_maxArgs = e->nargs + 1;
                 }
             }
@@ -2397,6 +2516,11 @@ static void walk_expr(TkExpr *e) {
         case TK_EX_BINARY: walk_expr(e->lhs); walk_expr(e->rhs); break;
         case TK_EX_TERNARY:
             walk_expr(e->cond); walk_expr(e->then_e); walk_expr(e->else_e); break;
+        case TK_EX_BLOCK:
+            wt_depth++; walk_stmts(e->stmts, e->scount2);
+            if (e->trailing) walk_expr(e->trailing);
+            wt_pop();
+            break;
         case TK_EX_CAST: walk_expr(e->lhs); break;
         case TK_EX_INDEX: {
             walk_expr(e->callee); walk_expr(e->index);
@@ -2994,8 +3118,15 @@ static void emit_stmt(TkStmt *s) {
         }
         case TK_ST_SPAWN_CALL: emit_val(s->sp_call); break;
         case TK_ST_DEFER: {
-            // stub: run inline (timing differs from true defer; tests avoid it)
-            fprintf(o, "    # defer-stub (runs inline)\n");
+            // True defer: body lives in a jumped-over fragment (same frame,
+            // so locals are visible; ends with ret) registered as a malloc
+            // chain node { next, fn }. Drained LIFO at the fn exit label.
+            // Bodies run at scope exit with variables read then (Zig-style).
+            int Ld = new_lbl(), Lend = new_lbl(), Lok = new_lbl();
+            char hm[64];
+            mem_slot(x_defer_head, hm, sizeof hm);
+            fprintf(o, "    jmp .L%d\n", Lend);
+            fprintf(o, ".L%d:\n", Ld);
             if (s->defer_is_block) {
                 xv_push();
                 emit_stmts(s->defer_blk, s->defer_n);
@@ -3008,6 +3139,18 @@ static void emit_stmt(TkStmt *s) {
                     emit_val(s->defer_simple->e1);
                 }
             }
+            fprintf(o, "    ret\n");
+            fprintf(o, ".L%d:\n", Lend);
+            fprintf(o, "    movq $16, %%rdi\n");
+            fprintf(o, "    call malloc@PLT\n");
+            fprintf(o, "    testq %%rax, %%rax\n    jnz .L%d\n", Lok);
+            fprintf(o, "    movl $1, %%edi\n    call exit@PLT\n");
+            fprintf(o, ".L%d:\n", Lok);
+            fprintf(o, "    movq %s, %%rcx\n", hm);
+            fprintf(o, "    movq %%rcx, (%%rax)\n");
+            fprintf(o, "    leaq .L%d(%%rip), %%rcx\n", Ld);
+            fprintf(o, "    movq %%rcx, 8(%%rax)\n");
+            fprintf(o, "    movq %%rax, %s\n", hm);
             break;
         }
         case TK_ST_FOR_EACH:
@@ -3140,6 +3283,8 @@ static void emit_fn(TkItem *it) {
     QW rw = rt ? ty_width(rt) : Q_VOID;
     int is_sret = (rw == Q_STRUCT);
     x_fn_exit = new_lbl();
+    // defer-chain head slot (emit-pass raffle; counted into frame_bytes below)
+    x_defer_head = frame_slots; frame_slots += 1;
     // home params (mirrors arg_home classification order)
     int ipos = 0, fpos = 0, spos = 0;
     static const char *ir[6] = {"%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"};
@@ -3202,8 +3347,38 @@ static void emit_fn(TkItem *it) {
             }
         }
     }
+    // defer chain starts empty
+    {
+        char hm[64];
+        mem_slot(x_defer_head, hm, sizeof hm);
+        fprintf(o, "    movq $0, %s\n", hm);
+    }
     emit_stmts(it->body, it->bcount);
     fprintf(o, ".Lfn%d:\n", x_fn_exit);
+    // drain defer chain LIFO (head NULL fast path); rax saved: scalar
+    // returns ride in rax across this loop, floats in xmm0 (untouched).
+    {
+        char hm[64];
+        mem_slot(x_defer_head, hm, sizeof hm);
+        int Ltop = new_lbl(), Ldone = new_lbl();
+        fprintf(o, "    pushq %%rax\n");
+        fprintf(o, ".L%d:\n", Ltop);
+        fprintf(o, "    movq %s, %%rax\n", hm);
+        fprintf(o, "    testq %%rax, %%rax\n");
+        fprintf(o, "    jz .L%d\n", Ldone);
+        fprintf(o, "    movq (%%rax), %%rcx\n");
+        fprintf(o, "    movq %%rcx, %s\n", hm);
+        fprintf(o, "    pushq %%rax\n");
+        fprintf(o, "    movq 8(%%rax), %%rax\n");
+        fprintf(o, "    subq $8, %%rsp\n");
+        fprintf(o, "    call *%%rax\n");
+        fprintf(o, "    addq $8, %%rsp\n");
+        fprintf(o, "    popq %%rdi\n");
+        fprintf(o, "    call free@PLT\n");
+        fprintf(o, "    jmp .L%d\n", Ltop);
+        fprintf(o, ".L%d:\n", Ldone);
+        fprintf(o, "    popq %%rax\n");
+    }
     fprintf(o, "    leave\n    ret\n");
 }
 

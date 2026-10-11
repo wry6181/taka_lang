@@ -693,8 +693,8 @@ i32 K_MINUSMINUS = 119;
 i32 K_EOF = 120;
 i32 K_ERROR = 121;
 
-struct Expr { i32 kind, u8* tstart, u64 tlen, Vec* path, Vec* targs, Expr* lhs, Expr* rhs, Expr* cond, Expr* then_e, Expr* else_e, i32 op, Type* cast_to, Expr* callee, Expr* index, char* field, Vec* args, Vec* sfields, Vec* elems, Expr* fill_elem, Expr* fill_n, Expr* scrut, Vec* arms, }
-struct Stmt { i32 kind, bool is_mut, Type* ty, Vec* names, Vec* inits, Expr* e1, Expr* e2, i32 op, bool has_assign, Vec* stmts, Expr* trailing, bool has_trailing, Expr* cond, Expr* cond_ex, Vec* then_s, Expr* then_t, Vec* eifs, Vec* els, Expr* els_t, bool has_els, Stmt* for_init_decl, Stmt* for_init_simple, bool for_init_empty, bool for_init_is_decl, Expr* for_cond, bool has_for_cond, Stmt* for_incr, bool has_incr, Expr* m_scrut, Vec* m_arms, Expr* ret_e, bool has_ret, char* label, }
+struct Expr { i32 kind, u8* tstart, u64 tlen, Vec* path, Vec* targs, Expr* lhs, Expr* rhs, Expr* cond, Expr* then_e, Expr* else_e, i32 op, Type* cast_to, Expr* callee, Expr* index, char* field, Vec* args, Vec* sfields, Vec* elems, Expr* fill_elem, Expr* fill_n, Expr* scrut, Vec* arms, Vec* stmts, Expr* trailing, }
+struct Stmt { i32 kind, bool is_mut, Type* ty, Vec* names, Vec* inits, Expr* e1, Expr* e2, i32 op, bool has_assign, Vec* stmts, Expr* trailing, bool has_trailing, Expr* cond, Expr* cond_ex, Vec* then_s, Expr* then_t, Vec* eifs, Vec* els, Expr* els_t, bool has_els, Stmt* for_init_decl, Stmt* for_init_simple, bool for_init_empty, bool for_init_is_decl, Expr* for_cond, bool has_for_cond, Stmt* for_incr, bool has_incr, Expr* m_scrut, Vec* m_arms, Expr* ret_e, bool has_ret, char* label, bool defer_is_block, Vec* defer_blk, Stmt* defer_simple, }
 struct Pat { i32 kind, u8* tstart, u64 tlen, i32 tkind, bool is_mut, char* name, Vec* path, Vec* args, Vec* fields, bool has_dotdot, Vec* or_next, }
 struct Type { i32 kind, bool is_const, i32 stars, bool is_ref, i32 prim, Vec* path, Vec* gargs, Vec* elems, Type* elem, }
 struct Item { i32 kind, char* fn_name, Vec* params, Type* ret, bool is_proto, Vec* body, Expr* trail, char* sname, Vec* fields, char* ename, Vec* vars, Stmt* gdecl, }
@@ -992,7 +992,7 @@ fn cv_expr(Arena* a, SX* s) -> Expr* {
     if (s.is_int) {
         return null;
     }
-    mut u8* m = zac(a, 176);
+    mut u8* m = zac(a, 208);
     if (m == null) {
         return null;
     }
@@ -1063,6 +1063,14 @@ fn cv_expr(Arena* a, SX* s) -> Expr* {
         e.cond = cv_expr(a, sx_kid(s, 1));
         e.then_e = cv_expr(a, sx_kid(s, 2));
         e.else_e = cv_expr(a, sx_kid(s, 3));
+    } else if (e.kind == X_EX_BLOCK) {
+        SX* sg = sx_kid(s, 1);
+        mut u64 i = 0;
+        while (i < vlen(sg.kids)) {
+            e.stmts = vpush(e.stmts, cv_stmt(a, sx_kid(sg, i)) as u8*);
+            i = i + 1;
+        }
+        e.trailing = cv_expr(a, sx_kid(s, 2));
     } else if (e.kind == X_EX_CALL) {
         e.callee = cv_expr(a, sx_kid(s, 1));
         SX* ag = sx_kid(s, 2);
@@ -1084,7 +1092,7 @@ fn cv_expr(Arena* a, SX* s) -> Expr* {
 }
 
 fn cv_stmt(Arena* a, SX* s) -> Stmt* {
-    mut u8* m = zac(a, 272);
+    mut u8* m = zac(a, 296);
     if (m == null) {
         return null;
     }
@@ -1220,6 +1228,20 @@ fn cv_stmt(Arena* a, SX* s) -> Stmt* {
         if (sx_kid(s, 2).ival != 0) {
             st.has_ret = true;
         }
+    } else if (st.kind == X_ST_DEFER) {
+        if (sx_kid(s, 1).ival != 0) {
+            st.defer_is_block = true;
+        }
+        SX* dg = sx_kid(s, 2);
+        mut u64 i = 0;
+        while (i < vlen(dg.kids)) {
+            st.defer_blk = vpush(st.defer_blk, cv_stmt(a, sx_kid(dg, i)) as u8*);
+            i = i + 1;
+        }
+        SX* ds = sx_kid(s, 3);
+        if (!ds.is_int) {
+            st.defer_simple = cv_stmt(a, ds);
+        }
     } else if (st.kind == X_ST_BREAK || st.kind == X_ST_CONTINUE) {
         SX* lb = sx_kid(s, 1);
         if (!lb.is_int) {
@@ -1334,7 +1356,7 @@ fn cv_item(Arena* a, SX* s) -> Item* {
         }
     } else if (it.kind == X_IT_GLOBAL) {
         mut Stmt* d = null;
-        mut u8* dm = zac(a, 272);
+        mut u8* dm = zac(a, 296);
         d = dm as Stmt*;
         d.kind = X_ST_DECL;
         if (sx_kid(s, 1).ival != 0) {
@@ -2463,6 +2485,18 @@ fn tcopy(Type* t) -> Type* {
     return n;
 }
 
+fn tcopy_star(Type* t) -> Type* {
+    if (t == null) {
+        return null;
+    }
+    Type* n = tcopy(t);
+    if (n == null) {
+        return null;
+    }
+    n.stars = n.stars + 1;
+    return n;
+}
+
 fn xinfer(Expr* e) -> Type* {
     if (e == null) {
         return null;
@@ -2602,7 +2636,7 @@ fn xinfer(Expr* e) -> Type* {
         }
         if (bt.kind == X_TY_PATH && vlen(bt.path) == 1) {
             char* s0 = vec_get(bt.path, 0) as char*;
-            if (tk_streq(s0, "List") && vlen(bt.gargs) == 1) {
+            if (tk_streq(s0, "List") && vlen(bt.gargs) == 1 && bt.stars == 0 && !bt.is_ref) {
                 return vec_get(bt.gargs, 0) as Type*;
             }
         }
@@ -2780,7 +2814,7 @@ fn emit_addr(Expr* e) {
         }
         if (bt != null && bt.kind == X_TY_PATH && vlen(bt.path) == 1) {
             char* s0 = vec_get(bt.path, 0) as char*;
-            if (tk_streq(s0, "List") && vlen(bt.gargs) == 1) {
+            if (tk_streq(s0, "List") && vlen(bt.gargs) == 1 && bt.stars == 0 && !bt.is_ref) {
                 buf_puts_c(g_o, "    movq (%rax), %rax\n");
             }
         }
@@ -3493,7 +3527,6 @@ fn emit_val_binary(Expr* e) {
             }
         }
     } else if (e.op == K_SHL) {
-        buf_puts_c(g_o, "    movq %rax, %rdx\n    movq %rcx, %rax\n    movq %rdx, %rcx\n");
         if (isq) {
             buf_puts_c(g_o, "    shlq %cl, %rax\n");
         } else {
@@ -3501,7 +3534,6 @@ fn emit_val_binary(Expr* e) {
         }
     } else if (e.op == K_SHR) {
         mut bool uns = lw == Q_U64 || lw == Q_U32 || lw == Q_U16 || lw == Q_U8;
-        buf_puts_c(g_o, "    movq %rax, %rdx\n    movq %rcx, %rax\n    movq %rdx, %rcx\n");
         if (isq) {
             if (uns) {
                 buf_puts_c(g_o, "    shrq %cl, %rax\n");
@@ -3667,6 +3699,18 @@ fn emit_val_ternary(Expr* e) {
     return;
 }
 
+fn emit_val_block(Expr* e) {
+    xv_push();
+    emit_stmts(e.stmts);
+    if (e.trailing != null) {
+        emit_val(e.trailing);
+    } else {
+        xerr("block value needs trailing expression");
+    }
+    xv_pop();
+    return;
+}
+
 fn emit_val(Expr* e) {
     if (e == null) {
         xerr("null expr");
@@ -3694,6 +3738,10 @@ fn emit_val(Expr* e) {
     }
     if (e.kind == X_EX_TERNARY) {
         emit_val_ternary(e);
+        return;
+    }
+    if (e.kind == X_EX_BLOCK) {
+        emit_val_block(e);
         return;
     }
     if (e.kind == X_EX_SIZEOF) {
@@ -3742,7 +3790,7 @@ fn emit_val(Expr* e) {
         xerr("array literal needs List<T> or [T; N] context in core");
         return;
     }
-    if (e.kind == X_EX_BRACE || e.kind == X_EX_BLOCK || e.kind == X_EX_LAMBDA || e.kind == X_EX_IF) {
+    if (e.kind == X_EX_BRACE || e.kind == X_EX_LAMBDA || e.kind == X_EX_IF) {
         xerr("block/lambda/if values TODO in core backend");
         return;
     }
@@ -3924,6 +3972,161 @@ fn arg_home(i32 i, Type* formal, bool sret) {
 }
 
 
+fn stmt_may_call(Stmt* s) -> bool {
+    if (s == null) {
+        return false;
+    }
+    if (s.kind == X_ST_DECL) {
+        mut u64 i = 0;
+        while (i < vlen(s.inits)) {
+            if (expr_may_call(vec_get(s.inits, i) as Expr*)) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (s.kind == X_ST_SIMPLE) {
+        if (expr_may_call(s.e1)) {
+            return true;
+        }
+        return s.has_assign && expr_may_call(s.e2);
+    }
+    if (s.kind == X_ST_BLOCK) {
+        mut u64 i = 0;
+        while (i < vlen(s.stmts)) {
+            if (stmt_may_call(vec_get(s.stmts, i) as Stmt*)) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return expr_may_call(s.trailing);
+    }
+    if (s.kind == X_ST_IF) {
+        if (s.cond_ex != null) {
+            if (expr_may_call(s.cond_ex)) {
+                return true;
+            }
+        } else {
+            if (expr_may_call(s.cond)) {
+                return true;
+            }
+        }
+        mut u64 i = 0;
+        while (i < vlen(s.then_s)) {
+            if (stmt_may_call(vec_get(s.then_s, i) as Stmt*)) {
+                return true;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < vlen(s.eifs)) {
+            EIF* ei = vec_get(s.eifs, i) as EIF*;
+            if (ei.e != null) {
+                if (expr_may_call(ei.e)) {
+                    return true;
+                }
+            } else {
+                if (expr_may_call(ei.c)) {
+                    return true;
+                }
+            }
+            mut u64 j = 0;
+            while (j < vlen(ei.s)) {
+                if (stmt_may_call(vec_get(ei.s, j) as Stmt*)) {
+                    return true;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        if (s.has_els) {
+            mut u64 k = 0;
+            while (k < vlen(s.els)) {
+                if (stmt_may_call(vec_get(s.els, k) as Stmt*)) {
+                    return true;
+                }
+                k = k + 1;
+            }
+        }
+        return false;
+    }
+    if (s.kind == X_ST_WHILE) {
+        if (s.cond_ex != null) {
+            if (expr_may_call(s.cond_ex)) {
+                return true;
+            }
+        } else {
+            if (expr_may_call(s.cond)) {
+                return true;
+            }
+        }
+        mut u64 i = 0;
+        while (i < vlen(s.then_s)) {
+            if (stmt_may_call(vec_get(s.then_s, i) as Stmt*)) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (s.kind == X_ST_FOR_C) {
+        if (!s.for_init_empty) {
+            if (s.for_init_is_decl) {
+                Stmt* d = s.for_init_decl;
+                mut u64 i = 0;
+                while (i < vlen(d.inits)) {
+                    if (expr_may_call(vec_get(d.inits, i) as Expr*)) {
+                        return true;
+                    }
+                    i = i + 1;
+                }
+            } else if (stmt_may_call(s.for_init_simple)) {
+                return true;
+            }
+        }
+        if (s.has_for_cond && expr_may_call(s.for_cond)) {
+            return true;
+        }
+        if (s.has_incr && stmt_may_call(s.for_incr)) {
+            return true;
+        }
+        mut u64 i = 0;
+        while (i < vlen(s.then_s)) {
+            if (stmt_may_call(vec_get(s.then_s, i) as Stmt*)) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (s.kind == X_ST_MATCH_STMT) {
+        if (expr_may_call(s.m_scrut)) {
+            return true;
+        }
+        mut u64 i = 0;
+        while (i < vlen(s.m_arms)) {
+            ArmS* am = vec_get(s.m_arms, i) as ArmS*;
+            if (am.guard != null && expr_may_call(am.guard)) {
+                return true;
+            }
+            mut u64 j = 0;
+            while (j < vlen(am.bs)) {
+                if (stmt_may_call(vec_get(am.bs, j) as Stmt*)) {
+                    return true;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    if (s.kind == X_ST_RETURN) {
+        return s.has_ret && expr_may_call(s.ret_e);
+    }
+    return false;
+}
+
 fn expr_may_call(Expr* e) -> bool {
     if (e == null) {
         return false;
@@ -3945,6 +4148,16 @@ fn expr_may_call(Expr* e) -> bool {
     }
     if (e.kind == X_EX_TERNARY) {
         return expr_may_call(e.cond) || expr_may_call(e.then_e) || expr_may_call(e.else_e);
+    }
+    if (e.kind == X_EX_BLOCK) {
+        mut u64 i = 0;
+        while (i < vlen(e.stmts)) {
+            if (stmt_may_call(vec_get(e.stmts, i) as Stmt*)) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return expr_may_call(e.trailing);
     }
     if (e.kind == X_EX_INDEX) {
         return expr_may_call(e.callee) || expr_may_call(e.index);
@@ -3981,7 +4194,7 @@ fn emit_call(Expr* e) {
         Type* bt = xinfer(e.callee.callee);
         if (bt != null && bt.kind == X_TY_PATH && vlen(bt.path) == 1) {
             char* s0 = vec_get(bt.path, 0) as char*;
-            if (tk_streq(s0, "List") && vlen(bt.gargs) == 1) {
+            if (tk_streq(s0, "List") && vlen(bt.gargs) == 1 && bt.stars == 0 && !bt.is_ref) {
                 if (vlen(e.args) != 1) {
                     xerr("push takes exactly one arg");
                     return;
@@ -4421,10 +4634,13 @@ fn xbind_add(Pat* p, Type* st) {
     }
     if (p.kind == X_PAT_BIND || p.kind == X_PAT_REF) {
         mut i32 slots = 1;
-        if (p.kind == X_PAT_BIND && st != null && ty_width(st) == Q_STRUCT) {
+        mut Type* vt = st;
+        if (p.kind == X_PAT_REF) {
+            vt = tcopy_star(st);
+        } else if (st != null && ty_width(st) == Q_STRUCT) {
             slots = slots_for_size(ty_size(st));
         }
-        xv_add(p.name, st, slots);
+        xv_add(p.name, vt, slots);
         return;
     }
     if (p.kind != X_PAT_PATH || vlen(p.path) != 2) {
@@ -4445,12 +4661,17 @@ fn xbind_add(Pat* p, Type* st) {
         mut u64 i = 0;
         while (i < vlen(p.args)) {
             Pat* a = vec_get(p.args, i) as Pat*;
-            if (a.kind != X_PAT_BIND) {
+            if (a.kind != X_PAT_BIND && a.kind != X_PAT_REF) {
                 i = i + 1;
                 continue;
             }
             mut Type* ft = vec_get(vv.ts, i) as Type*;
-            xv_add(a.name, ft, slots_for_size(ty_size(ft)));
+            if (a.kind == X_PAT_REF) {
+                ft = tcopy_star(ft);
+                xv_add(a.name, ft, 1);
+            } else {
+                xv_add(a.name, ft, slots_for_size(ty_size(ft)));
+            }
             i = i + 1;
         }
     } else if (vv.kind == 2) {
@@ -4458,7 +4679,7 @@ fn xbind_add(Pat* p, Type* st) {
         while (i < vlen(p.fields)) {
             FP* fp = vec_get(p.fields, i) as FP*;
             Pat* sp = fp.pat;
-            if (sp == null || sp.kind != X_PAT_BIND) {
+            if (sp == null || (sp.kind != X_PAT_BIND && sp.kind != X_PAT_REF)) {
                 i = i + 1;
                 continue;
             }
@@ -4475,7 +4696,11 @@ fn xbind_add(Pat* p, Type* st) {
                 i = i + 1;
                 continue;
             }
-            xv_add(sp.name, ft, slots_for_size(ty_size(ft)));
+            if (sp.kind == X_PAT_REF) {
+                xv_add(sp.name, tcopy_star(ft), 1);
+            } else {
+                xv_add(sp.name, ft, slots_for_size(ty_size(ft)));
+            }
             i = i + 1;
         }
     }
@@ -4484,6 +4709,21 @@ fn xbind_add(Pat* p, Type* st) {
 
 fn xbind_copy(Pat* p, i32 mslot, Type* st) {
     mut char* mm = slot_str(mslot, null as char*);
+    if (p.kind == X_PAT_REF) {
+        XV* v = xv_find(p.name);
+        if (v == null) {
+            xerr("binding missing");
+            return;
+        }
+        mut char* dst = slot_str(v.slot, v.name);
+        buf_puts_c(g_o, "    leaq ");
+        buf_puts_c(g_o, mm);
+        buf_puts_c(g_o, ", %rax\n");
+        buf_puts_c(g_o, "    movq %rax, ");
+        buf_puts_c(g_o, dst);
+        buf_putc(g_o, 10);
+        return;
+    }
     if (p.kind == X_PAT_BIND) {
         XV* v = xv_find(p.name);
         if (v == null) {
@@ -4557,7 +4797,7 @@ fn xbind_copy(Pat* p, i32 mslot, Type* st) {
         mut u64 i = 0;
         while (i < vlen(p.args)) {
             Pat* a = vec_get(p.args, i) as Pat*;
-            if (a.kind != X_PAT_BIND) {
+            if (a.kind != X_PAT_BIND && a.kind != X_PAT_REF) {
                 i = i + 1;
                 continue;
             }
@@ -4571,6 +4811,21 @@ fn xbind_copy(Pat* p, i32 mslot, Type* st) {
             mut i32 fw = ty_width(ft);
             mut i32 off = tuple_field_off(en, vi, i as i32);
             mut char* dst = slot_str(v.slot, v.name);
+            if (a.kind == X_PAT_REF) {
+                buf_puts_c(g_o, "    leaq ");
+                buf_puts_c(g_o, mm);
+                buf_puts_c(g_o, ", %rax\n");
+                if (off != 0) {
+                    buf_puts_c(g_o, "    addq $");
+                    buf_puti(g_o, off);
+                    buf_puts_c(g_o, ", %rax\n");
+                }
+                buf_puts_c(g_o, "    movq %rax, ");
+                buf_puts_c(g_o, dst);
+                buf_putc(g_o, 10);
+                i = i + 1;
+                continue;
+            }
             if (fw == Q_STRUCT) {
                 mut i32 esz = ty_size(ft);
                 buf_puts_c(g_o, "    leaq ");
@@ -4656,7 +4911,7 @@ fn xbind_copy(Pat* p, i32 mslot, Type* st) {
         while (i < vlen(p.fields)) {
             FP* fp = vec_get(p.fields, i) as FP*;
             Pat* sp = fp.pat;
-            if (sp == null || sp.kind != X_PAT_BIND) {
+            if (sp == null || (sp.kind != X_PAT_BIND && sp.kind != X_PAT_REF)) {
                 i = i + 1;
                 continue;
             }
@@ -4682,6 +4937,21 @@ fn xbind_copy(Pat* p, i32 mslot, Type* st) {
                 continue;
             }
             mut char* dst = slot_str(v.slot, v.name);
+            if (sp.kind == X_PAT_REF) {
+                buf_puts_c(g_o, "    leaq ");
+                buf_puts_c(g_o, mm);
+                buf_puts_c(g_o, ", %rax\n");
+                if (off != 0) {
+                    buf_puts_c(g_o, "    addq $");
+                    buf_puti(g_o, off);
+                    buf_puts_c(g_o, ", %rax\n");
+                }
+                buf_puts_c(g_o, "    movq %rax, ");
+                buf_puts_c(g_o, dst);
+                buf_putc(g_o, 10);
+                i = i + 1;
+                continue;
+            }
             if (fw == Q_STRUCT) {
                 mut i32 esz = ty_size(ft);
                 buf_puts_c(g_o, "    leaq ");
@@ -4769,13 +5039,8 @@ fn xbind_copy(Pat* p, i32 mslot, Type* st) {
 
 fn xalt_bool(Pat* p, i32 mslot, Type* st) {
     mut char* mm = slot_str(mslot, null as char*);
-    if (p.kind == X_PAT_WILD || p.kind == X_PAT_BIND) {
+    if (p.kind == X_PAT_WILD || p.kind == X_PAT_BIND || p.kind == X_PAT_REF) {
         buf_puts_c(g_o, "    movb $1, %al\n");
-        return;
-    }
-    if (p.kind == X_PAT_REF) {
-        xerr("ref patterns (&x) TODO in native backend");
-        buf_puts_c(g_o, "    xorb %al, %al\n");
         return;
     }
     if (p.kind == X_PAT_LIT) {
@@ -4933,7 +5198,7 @@ fn xalt_bool(Pat* p, i32 mslot, Type* st) {
                     buf_puts_c(g_o, "    sete %cl\n");
                     buf_puts_c(g_o, "    andb %cl, (%rsp)\n");
                     buf_puts_c(g_o, "    popq %rax\n");
-                } else if (a.kind != X_PAT_BIND && a.kind != X_PAT_WILD) {
+                } else if (a.kind != X_PAT_BIND && a.kind != X_PAT_WILD && a.kind != X_PAT_REF) {
                     xerr("nested patterns TODO in native backend");
                 }
                 i = i + 1;
@@ -4960,7 +5225,7 @@ fn xalt_bool(Pat* p, i32 mslot, Type* st) {
                     buf_puts_c(g_o, "    sete %cl\n");
                     buf_puts_c(g_o, "    andb %cl, (%rsp)\n");
                     buf_puts_c(g_o, "    popq %rax\n");
-                } else if (sp == null || (sp.kind != X_PAT_BIND && sp.kind != X_PAT_WILD)) {
+                } else if (sp == null || (sp.kind != X_PAT_BIND && sp.kind != X_PAT_WILD && sp.kind != X_PAT_REF)) {
                     xerr("nested patterns TODO in native backend");
                 }
                 i = i + 1;
@@ -5453,7 +5718,7 @@ fn walk_expr(Expr* e) {
             Type* bt = xinfer(e.callee.callee);
             if (bt != null && bt.kind == X_TY_PATH && vlen(bt.path) == 1) {
                 char* s0 = vec_get(bt.path, 0) as char*;
-                if (tk_streq(s0, "List") && vlen(bt.gargs) == 1) {
+                if (tk_streq(s0, "List") && vlen(bt.gargs) == 1 && bt.stars == 0 && !bt.is_ref) {
                     if ((vlen(e.args) as i32) + 1 > g_maxargs) {
                         g_maxargs = (vlen(e.args) as i32) + 1;
                     }
@@ -5508,6 +5773,12 @@ fn walk_expr(Expr* e) {
         walk_expr(e.cond);
         walk_expr(e.then_e);
         walk_expr(e.else_e);
+        return;
+    }
+    if (e.kind == X_EX_BLOCK) {
+        g_wtdepth = g_wtdepth + 1;
+        walk_stmts(e.stmts, e.trailing);
+        wt_pop();
         return;
     }
     if (e.kind == X_EX_CAST) {
@@ -5743,6 +6014,17 @@ fn walk_stmts(Vec* ss, Expr* trail) {
                     walk_expr(s.ret_e);
                 }
             }
+        } else if (s.kind == X_ST_DEFER) {
+            if (s.defer_is_block) {
+                g_wtdepth = g_wtdepth + 1;
+                walk_stmts(s.defer_blk, null);
+                wt_pop();
+            } else if (s.defer_simple != null) {
+                walk_expr(s.defer_simple.e1);
+                if (s.defer_simple.has_assign) {
+                    walk_expr(s.defer_simple.e2);
+                }
+            }
         }
         i = i + 1;
     }
@@ -5837,6 +6119,7 @@ fn emit_assign_combine(i32 op, i32 lw) {
         } else {
             buf_puts_c(g_o, "    movq (%rcx), %rax\n");
         }
+        buf_puts_c(g_o, "    pushq %rcx\n");
         buf_puts_c(g_o, "    movb %dl, %cl\n");
         if (op == K_SHL_EQ) {
             if (is64) {
@@ -5859,6 +6142,7 @@ fn emit_assign_combine(i32 op, i32 lw) {
                 }
             }
         }
+        buf_puts_c(g_o, "    popq %rcx\n");
         if (is64) {
             buf_puts_c(g_o, "    movq %rax, (%rcx)\n");
         } else {
@@ -6034,6 +6318,7 @@ mut Vec* g_loopct = null;
 mut i32 g_loopn = 0;
 mut i32 g_fnexit = 0;
 mut i32 g_srethome = -1;
+mut i32 g_deferhead = -1;
 mut Type* g_curret = null;
 
 fn loop_push(i32 b, i32 c) {
@@ -6664,6 +6949,54 @@ fn emit_stmt(Stmt* s) {
         buf_putc(g_o, 10);
         return;
     }
+    if (s.kind == X_ST_DEFER) {
+        mut i32 ld = new_lbl();
+        mut i32 lend = new_lbl();
+        mut i32 lok = new_lbl();
+        char* hm = slot_str(g_deferhead, null as char*);
+        buf_puts_c(g_o, "    jmp .L");
+        buf_puti(g_o, lend);
+        buf_putc(g_o, 10);
+        buf_puts_c(g_o, ".L");
+        buf_puti(g_o, ld);
+        buf_puts_c(g_o, ":\n");
+        if (s.defer_is_block) {
+            xv_push();
+            emit_stmts(s.defer_blk);
+            xv_pop();
+        } else if (s.defer_simple != null) {
+            if (s.defer_simple.has_assign) {
+                emit_assign_stmt(s.defer_simple.e1, s.defer_simple.e2, s.defer_simple.op);
+            } else {
+                emit_val(s.defer_simple.e1);
+            }
+        }
+        buf_puts_c(g_o, "    ret\n");
+        buf_puts_c(g_o, ".L");
+        buf_puti(g_o, lend);
+        buf_puts_c(g_o, ":\n");
+        buf_puts_c(g_o, "    movq $16, %rdi\n");
+        buf_puts_c(g_o, "    call malloc@PLT\n");
+        buf_puts_c(g_o, "    testq %rax, %rax\n    jnz .L");
+        buf_puti(g_o, lok);
+        buf_putc(g_o, 10);
+        buf_puts_c(g_o, "    movl $1, %edi\n    call exit@PLT\n");
+        buf_puts_c(g_o, ".L");
+        buf_puti(g_o, lok);
+        buf_puts_c(g_o, ":\n");
+        buf_puts_c(g_o, "    movq ");
+        buf_puts_c(g_o, hm);
+        buf_puts_c(g_o, ", %rcx\n");
+        buf_puts_c(g_o, "    movq %rcx, (%rax)\n");
+        buf_puts_c(g_o, "    leaq .L");
+        buf_puti(g_o, ld);
+        buf_puts_c(g_o, "(%rip), %rcx\n");
+        buf_puts_c(g_o, "    movq %rcx, 8(%rax)\n");
+        buf_puts_c(g_o, "    movq %rax, ");
+        buf_puts_c(g_o, hm);
+        buf_putc(g_o, 10);
+        return;
+    }
     if (s.kind == X_ST_HANDLE_STMT || s.kind == X_ST_TRANSACT_STMT) {
         xv_push();
         emit_stmts(s.stmts);
@@ -6814,6 +7147,8 @@ fn emit_fn(Item* it) {
     }
     bool is_sret = rw == Q_STRUCT;
     g_fnexit = new_lbl();
+    g_deferhead = g_frameslots;
+    g_frameslots = g_frameslots + 1;
     mut i32 ipos = 0;
     mut i32 fpos = 0;
     mut i32 spos = 0;
@@ -6919,10 +7254,46 @@ fn emit_fn(Item* it) {
         }
         j = j + 1;
     }
+    mut char* hm0 = slot_str(g_deferhead, null as char*);
+    buf_puts_c(g_o, "    movq $0, ");
+    buf_puts_c(g_o, hm0);
+    buf_putc(g_o, 10);
     emit_stmts(it.body);
     buf_puts_c(g_o, ".Lfn");
     buf_puti(g_o, g_fnexit);
     buf_puts_c(g_o, ":\n");
+    mut char* hm = slot_str(g_deferhead, null as char*);
+    mut i32 ltop = new_lbl();
+    mut i32 ldone = new_lbl();
+    buf_puts_c(g_o, "    pushq %rax\n");
+    buf_puts_c(g_o, ".L");
+    buf_puti(g_o, ltop);
+    buf_puts_c(g_o, ":\n");
+    buf_puts_c(g_o, "    movq ");
+    buf_puts_c(g_o, hm);
+    buf_puts_c(g_o, ", %rax\n");
+    buf_puts_c(g_o, "    testq %rax, %rax\n");
+    buf_puts_c(g_o, "    jz .L");
+    buf_puti(g_o, ldone);
+    buf_putc(g_o, 10);
+    buf_puts_c(g_o, "    movq (%rax), %rcx\n");
+    buf_puts_c(g_o, "    movq %rcx, ");
+    buf_puts_c(g_o, hm);
+    buf_putc(g_o, 10);
+    buf_puts_c(g_o, "    pushq %rax\n");
+    buf_puts_c(g_o, "    movq 8(%rax), %rax\n");
+    buf_puts_c(g_o, "    subq $8, %rsp\n");
+    buf_puts_c(g_o, "    call *%rax\n");
+    buf_puts_c(g_o, "    addq $8, %rsp\n");
+    buf_puts_c(g_o, "    popq %rdi\n");
+    buf_puts_c(g_o, "    call free@PLT\n");
+    buf_puts_c(g_o, "    jmp .L");
+    buf_puti(g_o, ltop);
+    buf_putc(g_o, 10);
+    buf_puts_c(g_o, ".L");
+    buf_puti(g_o, ldone);
+    buf_puts_c(g_o, ":\n");
+    buf_puts_c(g_o, "    popq %rax\n");
     buf_puts_c(g_o, "    leave\n    ret\n");
     return;
 }

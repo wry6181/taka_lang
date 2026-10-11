@@ -159,6 +159,24 @@ static TkExpr *b_primary(B*b){
         }
         TkExpr*e=new_expr(b,TK_EX_VAR); e->path=pth; return e;
     }
+    if(k==TOKEN_LBRACE){
+        // block value `{ stmts...; trailing }` (trailing expression required)
+        b->pos++; // {
+        TkExpr*e=new_expr(b,TK_EX_BLOCK);
+        int scap=0; e->stmts=NULL; e->scount2=0; e->trailing=NULL;
+        while(pk(b)!=TOKEN_RBRACE && pk(b)!=TOKEN_EOF){
+            // trailing? speculative expr parse ending exactly at '}'
+            int save=b->pos; const char *saveerr=b->err;
+            TkExpr*t=b_expr(b);
+            if(t && !b->err && pk(b)==TOKEN_RBRACE){ e->trailing=t; break; }
+            b->pos=save; b->err=saveerr;
+            TkStmt*s=b_stmt(b); if(!s||b->err)return NULL;
+            BAPPEND(b, e->stmts, e->scount2, scap, s); if(b->err)return NULL;
+        }
+        if(!e->trailing){ b->err="block value needs trailing expression"; return NULL; }
+        if(!expect(b,TOKEN_RBRACE,"'}'"))return NULL;
+        return e;
+    }
     b->err="expected expression"; return NULL;
 }
 static TkExpr *b_postfix(B*b){
@@ -372,6 +390,22 @@ static TkStmt *b_stmt(B*b){
     if(k==TOKEN_RETURN){ b->pos++; TkStmt*s=new_stmt(b,TK_ST_RETURN); if(pk(b)!=TOKEN_SEMI){ s->ret_e=b_expr(b); if(!s->ret_e||b->err)return NULL; s->has_ret=1; } if(!expect(b,TOKEN_SEMI,"';'"))return NULL; return s; }
     if(k==TOKEN_BREAK){ b->pos++; TkStmt*s=new_stmt(b,TK_ST_BREAK); if(!expect(b,TOKEN_SEMI,"';'"))return NULL; return s; }
     if(k==TOKEN_CONTINUE){ b->pos++; TkStmt*s=new_stmt(b,TK_ST_CONTINUE); if(!expect(b,TOKEN_SEMI,"';'"))return NULL; return s; }
+    if(k==TOKEN_DEFER){
+        b->pos++;
+        TkStmt*s=new_stmt(b,TK_ST_DEFER);
+        if(pk(b)==TOKEN_LBRACE){
+            b->pos++;
+            TkStmt**ss;int n;TkExpr*t; b_block_body(b,&ss,&n,&t); if(b->err)return NULL;
+            if(t){ b->err="defer block takes statements only"; return NULL; }
+            if(!expect(b,TOKEN_RBRACE,"'}'"))return NULL;
+            s->defer_is_block=1; s->defer_blk=ss; s->defer_n=n; return s;
+        }
+        TkExpr*e1=b_expr(b); if(!e1||b->err)return NULL;
+        TkStmt*q=new_stmt(b,TK_ST_SIMPLE); q->e1=e1;
+        if(is_assign(pk(b))){ q->assign_op=pk(b); b->pos++; q->e2=b_expr(b); if(!q->e2||b->err)return NULL; q->has_assign=1; }
+        if(!expect(b,TOKEN_SEMI,"';'"))return NULL;
+        s->defer_simple=q; return s;
+    }
     // decl? `[mut] type IDENT =` (also `auto`)
     {
         int save=b->pos; int p=save;
@@ -381,7 +415,7 @@ static TkStmt *b_stmt(B*b){
             // need IDENT '=' after type (approx: find IDENT followed by '=' before ';' with no '.'/'('/'[')
             int angle=0,par=0,br=0,found=0;
             for(int i=p;i<b->n;i++){ TokenKind kk=b->t[i].kind;
-                if(kk==TOKEN_LT)angle++; else if(kk==TOKEN_GT){if(angle>0)angle--;} else if(kk==TOKEN_LPAREN)par++; else if(kk==TOKEN_RPAREN){if(par>0)par--;else break;} else if(kk==TOKEN_LBRACK)br++; else if(kk==TOKEN_RBRACK){if(br>0)br--;} else if(kk==TOKEN_SEMI||kk==TOKEN_LBRACE||kk==TOKEN_RBRACE)break;
+                if(kk==TOKEN_LT)angle++; else if(kk==TOKEN_GT){if(angle>0)angle--;} else if(kk==TOKEN_SHR){if(angle>1)angle-=2;else break;} else if(kk==TOKEN_LPAREN)par++; else if(kk==TOKEN_RPAREN){if(par>0)par--;else break;} else if(kk==TOKEN_LBRACK)br++; else if(kk==TOKEN_RBRACK){if(br>0)br--;} else if(kk==TOKEN_SEMI||kk==TOKEN_LBRACE||kk==TOKEN_RBRACE)break;
                 if(angle==0&&par==0&&br==0){ if(kk==TOKEN_DOT){found=0;break;} if(kk==TOKEN_IDENT&&i+1<b->n&&(b->t[i+1].kind==TOKEN_EQ)){ found=(i>save); break; } } }
             if(found){
                 int ismut=match(b,TOKEN_MUT);

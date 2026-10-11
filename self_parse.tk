@@ -1000,8 +1000,8 @@ fn tk_kind_name(i32 k) -> sview {
 
 
 // ---- AST node types (stage 2; only builder-set fields) ----
-struct Expr { i32 kind, TkTok* tok, Vec* path, Expr* lhs, Expr* rhs, Expr* cond, Expr* then_e, Expr* else_e, i32 op, Type* cast_to, Expr* callee, Expr* index, char* field, Vec* args, Vec* sfields, Vec* elems, Expr* scrut, Vec* arms, }
-struct Stmt { i32 kind, bool is_mut, Type* ty, Vec* names, Vec* inits, Expr* e1, Expr* e2, i32 op, bool has_assign, Vec* stmts, Expr* trailing, bool has_trailing, Expr* cond, Expr* cond_ex, Vec* then_s, Expr* then_t, Vec* eifs, Vec* els, Expr* els_t, bool has_els, Stmt* for_init_decl, Stmt* for_init_simple, bool for_init_empty, bool for_init_is_decl, Expr* for_cond, bool has_for_cond, Stmt* for_incr, bool has_incr, Expr* m_scrut, Vec* m_arms, Expr* ret_e, bool has_ret, char* label, }
+struct Expr { i32 kind, TkTok* tok, Vec* path, Expr* lhs, Expr* rhs, Expr* cond, Expr* then_e, Expr* else_e, i32 op, Type* cast_to, Expr* callee, Expr* index, char* field, Vec* args, Vec* sfields, Vec* elems, Expr* scrut, Vec* arms, Vec* stmts, Expr* trailing, }
+struct Stmt { i32 kind, bool is_mut, Type* ty, Vec* names, Vec* inits, Expr* e1, Expr* e2, i32 op, bool has_assign, Vec* stmts, Expr* trailing, bool has_trailing, Expr* cond, Expr* cond_ex, Vec* then_s, Expr* then_t, Vec* eifs, Vec* els, Expr* els_t, bool has_els, Stmt* for_init_decl, Stmt* for_init_simple, bool for_init_empty, bool for_init_is_decl, Expr* for_cond, bool has_for_cond, Stmt* for_incr, bool has_incr, Expr* m_scrut, Vec* m_arms, Expr* ret_e, bool has_ret, char* label, bool defer_is_block, Vec* defer_blk, Stmt* defer_simple, }
 struct Pat { i32 kind, TkTok* tok, bool is_mut, char* name, Vec* path, Vec* args, Vec* fields, bool has_dotdot, Vec* or_next, }
 struct Type { i32 kind, bool is_const, i32 stars, bool is_ref, i32 prim, Vec* path, Vec* gargs, }
 struct Item { i32 kind, char* fn_name, Vec* params, Type* ret, bool is_proto, Vec* body, Expr* trail, char* sname, Vec* fields, char* ename, Vec* vars, Stmt* gdecl, }
@@ -1035,7 +1035,7 @@ fn vlen(Vec* v) -> u64 {
 }
 
 fn new_expr(TkB* b, i32 kind) -> Expr* {
-    u8* m = zac(&b.arena, 160);
+    u8* m = zac(&b.arena, 192);
     if (m == null) {
         return null;
     }
@@ -1045,7 +1045,7 @@ fn new_expr(TkB* b, i32 kind) -> Expr* {
 }
 
 fn new_stmt(TkB* b, i32 kind) -> Stmt* {
-    u8* m = zac(&b.arena, 272);
+    u8* m = zac(&b.arena, 296);
     if (m == null) {
         return null;
     }
@@ -1526,6 +1526,40 @@ fn b_primary(TkB* b) -> Expr* {
             return null;
         }
         e.path = segs;
+        return e;
+    }
+    if (k == K_LBRACE) {
+        b.pos = b.pos + 1;
+        Expr* e = new_expr(b, X_EX_BLOCK);
+        if (e == null) {
+            return null;
+        }
+        while (b_pk(b) != K_RBRACE && b_pk(b) != K_EOF) {
+            u64 save = b.pos;
+            u64 saveerr = g_berr;
+            Expr* t = b_expr(b);
+            if (t != null && g_berr == 0 && b_pk(b) == K_RBRACE) {
+                e.trailing = t;
+                break;
+            }
+            b.pos = save;
+            g_berr = saveerr;
+            Stmt* s = b_stmt(b);
+            if (s == null || g_berr != 0) {
+                return null;
+            }
+            e.stmts = vpush(e.stmts, s as u8*);
+            if (g_berr != 0) {
+                return null;
+            }
+        }
+        if (e.trailing == null) {
+            g_berr = "block value needs trailing expression" as u64;
+            return null;
+        }
+        if (b_expect(b, K_RBRACE, "'}'") == null) {
+            return null;
+        }
         return e;
     }
     g_berr = "expected expression" as u64;
@@ -2340,6 +2374,58 @@ fn b_stmt(TkB* b) -> Stmt* {
         }
         return s;
     }
+    if (k == K_DEFER) {
+        b.pos = b.pos + 1;
+        Stmt* s = new_stmt(b, X_ST_DEFER);
+        if (s == null) {
+            return null;
+        }
+        if (b_pk(b) == K_LBRACE) {
+            b.pos = b.pos + 1;
+            u8* om = zac(&b.arena, 16);
+            if (om == null) {
+                return null;
+            }
+            BlkOut* o = om as BlkOut*;
+            b_block_body(b, o);
+            if (g_berr != 0) {
+                return null;
+            }
+            if (o.t != null) {
+                g_berr = "defer block takes statements only" as u64;
+                return null;
+            }
+            if (b_expect(b, K_RBRACE, "'}'") == null) {
+                return null;
+            }
+            s.defer_is_block = true;
+            s.defer_blk = o.ss;
+            return s;
+        }
+        Expr* e1 = b_expr(b);
+        if (e1 == null || g_berr != 0) {
+            return null;
+        }
+        Stmt* q = new_stmt(b, X_ST_SIMPLE);
+        if (q == null) {
+            return null;
+        }
+        q.e1 = e1;
+        if (b_is_assign(b_pk(b))) {
+            q.op = b_pk(b);
+            b.pos = b.pos + 1;
+            q.e2 = b_expr(b);
+            if (q.e2 == null || g_berr != 0) {
+                return null;
+            }
+            q.has_assign = true;
+        }
+        if (b_expect(b, K_SEMI, "';'") == null) {
+            return null;
+        }
+        s.defer_simple = q;
+        return s;
+    }
     u64 save = b.pos;
     mut u64 p = save;
     if (tok_at(b, p).kind == K_MUT) {
@@ -2852,7 +2938,7 @@ fn b_items(TkB* b, mut Vec* items) -> bool {
         }
         Item* it = im as Item*;
         it.kind = X_IT_GLOBAL;
-        u8* dm = zac(&b.arena, 272);
+        u8* dm = zac(&b.arena, 296);
         if (dm == null) {
             return false;
         }
@@ -3113,6 +3199,18 @@ fn dump_expr(Buf* b, Arena* a, Expr* e) {
         dump_expr(b, a, e.then_e);
         buf_putc(b, 32);
         dump_expr(b, a, e.else_e);
+    } else if (e.kind == X_EX_BLOCK) {
+        buf_puts_c(b, " (");
+        mut u64 bi = 0;
+        while (bi < vlen(e.stmts)) {
+            if (bi != 0) {
+                buf_putc(b, 32);
+            }
+            dump_stmt(b, a, vec_get(e.stmts, bi) as Stmt*);
+            bi = bi + 1;
+        }
+        buf_puts_c(b, ") ");
+        dump_expr(b, a, e.trailing);
     } else if (e.kind == X_EX_CALL) {
         buf_putc(b, 32);
         dump_expr(b, a, e.callee);
@@ -3416,6 +3514,26 @@ fn dump_stmt(Buf* b, Arena* a, Stmt* s) {
         }
         buf_putc(b, 32);
         buf_puti(b, a, b2i(s.has_ret));
+    } else if (s.kind == X_ST_DEFER) {
+        buf_putc(b, 32);
+        buf_puti(b, a, b2i(s.defer_is_block));
+        buf_puts_c(b, " (");
+        if (s.defer_is_block) {
+            mut u64 i = 0;
+            while (i < vlen(s.defer_blk)) {
+                if (i != 0) {
+                    buf_putc(b, 32);
+                }
+                dump_stmt(b, a, vec_get(s.defer_blk, i) as Stmt*);
+                i = i + 1;
+            }
+        }
+        buf_puts_c(b, ") ");
+        if (s.defer_simple != null) {
+            dump_stmt(b, a, s.defer_simple);
+        } else {
+            buf_putc(b, 48);
+        }
     } else if (s.kind == X_ST_BREAK || s.kind == X_ST_CONTINUE) {
         if (s.label == null) {
             buf_puts_c(b, " 0");
@@ -3735,6 +3853,7 @@ struct Scope { Vec* vars, Scope* parent, }
 
 mut u64 g_serr = 0;
 mut u64 g_items = 0;
+mut i32 g_in_defer = 0;
 
 fn serr(char* msg, char* detail) {
     tk_eprint("sema error: " as u8*, 12);
@@ -3827,7 +3946,7 @@ fn pat_arg_simple(Pat* p) -> bool {
     if (p == null) {
         return true;
     }
-    if (p.kind == X_PAT_BIND || p.kind == X_PAT_WILD || p.kind == X_PAT_LIT) {
+    if (p.kind == X_PAT_BIND || p.kind == X_PAT_WILD || p.kind == X_PAT_LIT || p.kind == X_PAT_REF) {
         return true;
     }
     return false;
@@ -4058,6 +4177,9 @@ fn check_expr(Scope* s, Expr* e) {
         check_expr(s, e.cond);
         check_expr(s, e.then_e);
         check_expr(s, e.else_e);
+    } else if (e.kind == X_EX_BLOCK) {
+        Scope* inner = scope_new(s);
+        check_stmts(inner, e.stmts, e.trailing);
     } else if (e.kind == X_EX_PAREN) {
         check_expr(s, e.lhs);
     } else if (e.kind == X_EX_INDEX) {
@@ -4233,8 +4355,24 @@ fn check_stmt(Scope* s, Stmt* st) {
         Scope* body = scope_new(loop);
         check_stmts(body, st.then_s, st.then_t);
     } else if (st.kind == X_ST_RETURN) {
+        if (g_in_defer != 0) {
+            serr("return inside defer is not allowed", null);
+        }
         if (st.has_ret) {
             check_expr(s, st.ret_e);
+        }
+    } else if (st.kind == X_ST_DEFER) {
+        g_in_defer = g_in_defer + 1;
+        if (st.defer_is_block) {
+            Scope* inner = scope_new(s);
+            check_stmts(inner, st.defer_blk, null);
+        } else if (st.defer_simple != null) {
+            check_stmt(s, st.defer_simple);
+        }
+        g_in_defer = g_in_defer - 1;
+    } else if (st.kind == X_ST_BREAK || st.kind == X_ST_CONTINUE) {
+        if (g_in_defer != 0) {
+            serr("break/continue inside defer is not allowed", null);
         }
     }
     return;
@@ -4336,6 +4474,7 @@ fn type_reaches_cycle(Type* t, mut Vec* path) -> bool {
 
 fn sema_check(Vec* items) -> i32 {
     g_serr = 0;
+    g_in_defer = 0;
     g_items = items as u64;
     Scope* glob = scope_new(null as Scope*);
     mut u64 i = 0;

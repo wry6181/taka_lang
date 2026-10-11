@@ -142,6 +142,15 @@ static void dump_expr(FILE *o, TkExpr *e) {
             esc(o, e->field, (u64)strlen(e->field)); break;
         case TK_EX_POST_INC: case TK_EX_POST_DEC:
             fputc(' ', o); dump_expr(o, e->lhs); break;
+        case TK_EX_BLOCK: {
+            fputs(" (", o);
+            for (int i = 0; i < e->scount2; i++) {
+                if (i) fputc(' ', o);
+                dump_stmt(o, e->stmts[i]);
+            }
+            fputs(") ", o); dump_expr(o, e->trailing);
+            break;
+        }
         default: break; // unreached builder kinds: kind marker only
     }
     fputc(')', o);
@@ -277,6 +286,16 @@ static void dump_stmt(FILE *o, TkStmt *s) {
             fputc(' ', o); dump_expr(o, s->has_ret ? s->ret_e : NULL);
             fprintf(o, " %d", s->has_ret ? 1 : 0);
             break;
+        case TK_ST_DEFER: {
+            fprintf(o, " %d (", s->defer_is_block ? 1 : 0);
+            if (s->defer_is_block) {
+                for (int k = 0; k < s->defer_n; k++) { if (k) fputc(' ', o); dump_stmt(o, s->defer_blk[k]); }
+            }
+            fputs(") ", o);
+            if (s->defer_simple) dump_stmt(o, s->defer_simple);
+            else fputs("0", o);
+            break;
+        }
         case TK_ST_BREAK: case TK_ST_CONTINUE:
             if (s->label) { fputc(' ', o); esc(o, s->label, (u64)strlen(s->label)); }
             else fputs(" 0", o);

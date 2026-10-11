@@ -36,6 +36,33 @@ fn shape_val(Shape s) -> i32 {
     return out;
 }
 
+fn ref_val(Opt o) -> i32 {
+    mut i32 out = 0;
+    match o {
+        Opt::Some(&v) => { out = *v + 100; },
+        Opt::None => { out = 0 - 2; },
+    }
+    return out;
+}
+
+fn ref_top(Shape s) -> i32 {
+    mut i32 out = 0;
+    match s {
+        &p => { out = 50; },
+        _ => { out = 51; },
+    }
+    return out;
+}
+
+fn ref_field(Shape s) -> i32 {
+    mut i32 out = 0;
+    match s {
+        Shape::Rect { w: &wv, h } => { out = *wv + h; },
+        _ => { out = 0 - 3; },
+    }
+    return out;
+}
+
 fn main() {
     tk_print_i32(classify(Color::Red));
     tk_print_i32(classify(Color::Blue));
@@ -52,5 +79,10 @@ fn main() {
     tk_print_i32(shape_val(s1));
     tk_print_i32(shape_val(s2));
     tk_print_i32(shape_val(s3));
+    tk_print_i32(ref_val(a));
+    tk_print_i32(ref_val(c));
+    tk_print_i32(ref_top(s1));
+    tk_print_i32(ref_field(s2));
+    tk_print_i32(ref_field(s1));
     return;
 }

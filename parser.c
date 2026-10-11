@@ -1089,14 +1089,39 @@ static void parse_full_primary(Parser *p) {
                 else if (full_peek_kind(p)==TOKEN_RBRACE) { p->pos++; return; }
                 else parse_error(full_raw_tok(p), "expected ';' after declaration in block expr");
             } else {
-                // parse expr (could be call, etc.)
-                parse_full_expr(p);
-                if (full_match(p, TOKEN_SEMI)) { consumed=TRUE; }
-                else if (full_match(p, TOKEN_COMMA)) { consumed=TRUE; }
-                else if (full_peek_kind(p)==TOKEN_RBRACE) { p->pos++; return; }
-                else {
-                    // Could be block-like without ;? e.g. `{ t+1 }` trailing expr then } — handled above (RBRACE). Else error.
-                    parse_error(full_raw_tok(p), "expected ',' ';' or '}' in brace expr");
+                // scan for ';' at depth 0 (like parse_full_block):
+                // with ';' it's a statement (handles assignments), else trailing expr
+                int paren=0, brack=0, brace=0;
+                int idx_semi=-1;
+                for (int i=p->pos; i<p->count; i++) {
+                    TokenKind kk = p->toks[i].kind;
+                    if (kk==TOKEN_LPAREN) paren++;
+                    else if (kk==TOKEN_RPAREN) { if (paren>0) paren--; }
+                    else if (kk==TOKEN_LBRACK) brack++;
+                    else if (kk==TOKEN_RBRACK) { if (brack>0) brack--; }
+                    else if (kk==TOKEN_LBRACE) brace++;
+                    else if (kk==TOKEN_RBRACE) {
+                        if (brace==0) break;
+                        else brace--;
+                    }
+                    else if (kk==TOKEN_SEMI && paren==0 && brack==0 && brace==0) { idx_semi=i; break; }
+                    else if (kk==TOKEN_EOF) break;
+                }
+                if (idx_semi>=0) {
+                    // statement consumes its own ';' (or is bracelike); allow ',' separator
+                    parse_full_statement(p);
+                    if (full_match(p, TOKEN_COMMA)) { consumed=TRUE; }
+                    // else loop continues (RBRACE/EOF handled at top)
+                } else {
+                    // parse expr (could be call, etc.)
+                    parse_full_expr(p);
+                    if (full_match(p, TOKEN_SEMI)) { consumed=TRUE; }
+                    else if (full_match(p, TOKEN_COMMA)) { consumed=TRUE; }
+                    else if (full_peek_kind(p)==TOKEN_RBRACE) { p->pos++; return; }
+                    else {
+                        // Could be block-like without ;? e.g. `{ t+1 }` trailing expr then } — handled above (RBRACE). Else error.
+                        parse_error(full_raw_tok(p), "expected ',' ';' or '}' in brace expr");
+                    }
                 }
             }
             UNUSED(s); UNUSED(consumed);
@@ -1776,12 +1801,26 @@ static const char *read_file(mem_arena *arena, const char *path) {
     return buf;
 }
 
+static void usage_to(FILE *f, const char *argv0) {
+    fprintf(f, "taka — cargo-like driver for the taka language\n");
+    fprintf(f, "usage:\n");
+    fprintf(f, "  %s [flags] build file.tk [-o out]   compile to a native binary\n", argv0);
+    fprintf(f, "  %s [flags] run file.tk [args..]     build to temp and execute\n", argv0);
+    fprintf(f, "  %s [flags] test file.tk [more..]    build+run each file, report ok/FAILED\n", argv0);
+    fprintf(f, "  %s [flags] check file.tk            typecheck only (like cargo check)\n", argv0);
+    fprintf(f, "  %s [flags] emit-c file.tk [-o f.c]  write the generated C (inspect/optimize by hand)\n", argv0);
+    fprintf(f, "  %s [flags] sexp file.tk             dump the canonical AST sexp\n", argv0);
+    fprintf(f, "  %s [flags] file.tk                  parse, check, emit (<base>.gen.c or .s)\n", argv0);
+    fprintf(f, "  %s help                             show this help\n", argv0);
+    fprintf(f, "flags (before the subcommand):\n");
+    fprintf(f, "  --backend=c|native   c = via C + cc optimizer (default); native = direct x86-64\n");
+    fprintf(f, "  --release            optimize the C build (-O2; default is -O0 for fast builds)\n");
+    fprintf(f, "  --dev                fast unoptimized C build (-O0; the default)\n");
+    fprintf(f, "  -h, --help           show this help\n");
+}
+
 static void usage(const char *argv0) {
-    fprintf(stderr, "usage:\n");
-    fprintf(stderr, "  %s [--backend=c|native] file.tk              parse, check, emit (<base>.gen.c or .s)\n", argv0);
-    fprintf(stderr, "  %s [--backend=c|native] build file.tk [-o out]  build a native binary\n", argv0);
-    fprintf(stderr, "  %s [--backend=c|native] run file.tk [args..]    build to temp and execute\n", argv0);
-    fprintf(stderr, "backends: c = via C (default); native = direct x86-64, no C involved\n");
+    usage_to(stderr, argv0);
 }
 
 static int ends_with(const char *s, const char *suf) {
@@ -1825,11 +1864,12 @@ static void cleanup_tmpdir(const char *dir, const char *cfile, const char *bin) 
 }
 
 // Compile one C file to a native binary. Returns 0 on success.
-static int cc_build(const char *cfile, const char *bin) {
+static int cc_build(const char *cfile, const char *bin, int execstack, int release) {
     char inc[1024];
     include_dir(inc, sizeof inc);
     char cmd[4096];
-    int w = snprintf(cmd, sizeof cmd, "cc -O2 -I\"%s\" \"%s\" -o \"%s\"", inc, cfile, bin);
+    int w = snprintf(cmd, sizeof cmd, "cc %s -I\"%s\" %s\"%s\" -o \"%s\"",
+        release ? "-O2" : "-O0", inc, execstack ? "-Wl,-z,execstack " : "", cfile, bin);
     if (w < 0 || (size_t)w >= sizeof cmd) { fprintf(stderr, "taka: paths too long\n"); return 1; }
     int rc = system(cmd);
     if (rc != 0) { fprintf(stderr, "taka: C compile failed\n"); return 1; }
@@ -1841,17 +1881,36 @@ int main(int argc, char **argv) {
     const char *backend = "c";
     const char *infile = NULL;
     const char *outopt = NULL;
+    int want_release = 0, want_dev = 0, gave_backend = 0;
     int ai = 1; // first non-flag arg
-    if (ai < argc && strncmp(argv[ai], "--backend=", 10) == 0) {
-        backend = argv[ai] + 10;
-        if (strcmp(backend, "c") != 0 && strcmp(backend, "native") != 0) {
-            fprintf(stderr, "taka: unknown backend '%s'\n", backend);
-            return 1;
-        }
-        ai++;
+    for (; ai < argc; ai++) {
+        if (strncmp(argv[ai], "--backend=", 10) == 0) {
+            backend = argv[ai] + 10;
+            if (strcmp(backend, "c") != 0 && strcmp(backend, "native") != 0) {
+                fprintf(stderr, "taka: unknown backend '%s'\n", backend);
+                return 1;
+            }
+            gave_backend = 1;
+        } else if (strcmp(argv[ai], "--release") == 0) {
+            want_release = 1;
+        } else if (strcmp(argv[ai], "--dev") == 0) {
+            want_dev = 1;
+        } else if (strcmp(argv[ai], "--help") == 0 || strcmp(argv[ai], "-h") == 0) {
+            usage_to(stdout, argv[0]);
+            return 0;
+        } else break;
+    }
+    if (want_release && want_dev) {
+        fprintf(stderr, "taka: --release and --dev are mutually exclusive\n");
+        return 1;
     }
     int extra_start = 0; // first argv index of run-args (run mode only)
-    if (ai < argc && strcmp(argv[ai], "sexp") == 0) {
+    const char *test_files[512];
+    int test_n = 0;
+    if (ai < argc && strcmp(argv[ai], "help") == 0) {
+        usage_to(stdout, argv[0]);
+        return 0;
+    } else if (ai < argc && strcmp(argv[ai], "sexp") == 0) {
         mode = "sexp";
         ai++;
         if (ai >= argc) { usage(argv[0]); return 1; }
@@ -1877,12 +1936,72 @@ int main(int argc, char **argv) {
         infile = argv[ai++];
         extra_start = ai;
         if (extra_start < argc && strcmp(argv[extra_start], "--") == 0) extra_start++;
+    } else if (ai < argc && strcmp(argv[ai], "test") == 0) {
+        mode = "test";
+        ai++;
+        while (ai < argc && test_n < 512) test_files[test_n++] = argv[ai++];
+        if (test_n == 0) { usage(argv[0]); return 1; }
+    } else if (ai < argc && strcmp(argv[ai], "emit-c") == 0) {
+        if (gave_backend && strcmp(backend, "c") != 0) {
+            fprintf(stderr, "taka: emit-c always uses the C backend\n");
+            return 1;
+        }
+        backend = "c";
+        mode = "emitc";
+        ai++;
+        if (ai >= argc) { usage(argv[0]); return 1; }
+        infile = argv[ai++];
+        while (ai < argc) {
+            if (strcmp(argv[ai], "-o") == 0 && ai + 1 < argc) { outopt = argv[++ai]; ai++; }
+            else { usage(argv[0]); return 1; }
+        }
     } else if (ai + 1 == argc) {
         mode = "gen";
         infile = argv[ai];
     } else {
         usage(argv[0]);
         return 1;
+    }
+
+    // test: build+run each file in a child (reuses `run` verbatim),
+    // then report ok/FAILED per file, cargo-style.
+    if (strcmp(mode, "test") == 0) {
+        int fails = 0;
+        for (int ti = 0; ti < test_n; ti++) {
+            printf("test %s ... ", test_files[ti]);
+            fflush(stdout);
+            pid_t pid = fork();
+            if (pid < 0) { perror("fork"); return 1; }
+            if (pid == 0) {
+                char beflag[32];
+                snprintf(beflag, sizeof beflag, "--backend=%s", backend);
+                const char *cargv[9];
+                int ci = 0;
+                cargv[ci++] = argv[0];
+                cargv[ci++] = beflag;
+                if (want_release) cargv[ci++] = "--release";
+                if (want_dev) cargv[ci++] = "--dev";
+                cargv[ci++] = "run";
+                cargv[ci++] = test_files[ti];
+                cargv[ci++] = NULL;
+                execv(argv[0], (char *const *)cargv);
+                perror("execv");
+                _exit(127);
+            }
+            int status = 0;
+            while (waitpid(pid, &status, 0) < 0) {}
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                printf("ok\n");
+            } else if (WIFEXITED(status)) {
+                printf("FAILED (exit %d)\n", WEXITSTATUS(status));
+                fails++;
+            } else {
+                printf("FAILED (signal)\n");
+                fails++;
+            }
+        }
+        printf("test result: %d passed; %d failed\n", test_n - fails, fails);
+        return fails ? 1 : 0;
     }
 
     mem_arena *arena = arena_create(MByte(32));
@@ -1909,7 +2028,7 @@ int main(int argc, char **argv) {
 
     Parser pf = {toks, n, 0, arena, 0, 0};
     parse_full_program(&pf);
-    if (strcmp(mode, "gen") == 0) printf("parse OK\n");
+    if (strcmp(mode, "gen") == 0 || strcmp(mode, "emitc") == 0) printf("parse OK\n");
 
     // Emit C: legacy single-fn path for mut.tk, core backend otherwise.
     // In build/run modes the C file lives in a temp dir (no .gen.c kept).
@@ -1918,8 +2037,9 @@ int main(int argc, char **argv) {
     const char *gen_path = NULL;
     char gen_buf[1024];
     int use_c = (strcmp(backend, "c") == 0);
-    if (strcmp(mode, "gen") == 0) {
-    if (use_c && ends_with(infile, "mut.tk")) {
+    int is_emit = (strcmp(mode, "gen") == 0 || strcmp(mode, "emitc") == 0);
+    if (is_emit) {
+    if (strcmp(mode, "gen") == 0 && use_c && ends_with(infile, "mut.tk")) {
             Parser p = {toks, n, 0, arena, 0, 0};
             FnDef *fn = parse_program(&p);
             print_fn(fn);
@@ -1928,9 +2048,13 @@ int main(int argc, char **argv) {
             arena_destroy(arena);
             return 0;
         }
-        char stem[256];
-        stem_of(infile, stem, sizeof stem);
-        snprintf(gen_buf, sizeof gen_buf, use_c ? "%s.gen.c" : "%s.s", stem);
+        if (outopt) {
+            snprintf(gen_buf, sizeof gen_buf, "%s", outopt);
+        } else {
+            char stem[256];
+            stem_of(infile, stem, sizeof stem);
+            snprintf(gen_buf, sizeof gen_buf, use_c ? "%s.gen.c" : "%s.s", stem);
+        }
         gen_path = gen_buf;
     } else {
         if (make_tmpdir(tmpdir, sizeof tmpdir) != 0) { arena_destroy(arena); return 1; }
@@ -1989,7 +2113,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (strcmp(mode, "gen") == 0) {
+    if (strcmp(mode, "gen") == 0 || strcmp(mode, "emitc") == 0) {
         printf("sema OK\nwrote %s\n", gen_path);
         arena_destroy(arena);
         return 0;
@@ -2012,7 +2136,7 @@ int main(int argc, char **argv) {
         bin_path = bin_tmp;
     }
 
-    if (cc_build(gen_path, bin_path) != 0) {
+    if (cc_build(gen_path, bin_path, use_c && cgen_needs_execstack(), want_release) != 0) {
         cleanup_tmpdir(tmpdir, gen_path, NULL);
         arena_destroy(arena);
         return 1;

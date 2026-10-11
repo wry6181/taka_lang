@@ -17,6 +17,7 @@ typedef struct { char *name; b32 is_mut; b32 is_ref; } ScopeVar;
 VEC_DECLARE(ScopeVarVec, ScopeVar);
 
 static int errors = 0;
+static int in_defer = 0; // >0 while checking a defer body: no return/break/continue
 static void err(const char *msg, const char *detail) {
     fprintf(stderr, "sema error: %s%s%s%s\n", msg, detail?" '":"", detail?detail:"", detail?"'":"");
     errors++;
@@ -196,7 +197,8 @@ static void check_expr(Scope *s, TkExpr *e) {
         case TK_EX_LAMBDA: break; // captures checked at backend (non-escaping stub)
         case TK_EX_SIZEOF: if(!e->sizeof_is_type) check_expr(s, e->sizeof_ex); break;
         case TK_EX_OFFSETOF: break;
-        case TK_EX_BRACE: case TK_EX_BLOCK: break;
+        case TK_EX_BRACE: break;
+        case TK_EX_BLOCK: { Scope *inner = scope_new(s->arena, s); check_stmts(inner, e->stmts, e->scount2, e->trailing); break; }
         default: break;
     }
 }
@@ -221,7 +223,7 @@ static TkItem *sema_find_enum(const char *name) {
 // literals (variant paths without args would need type-directed resolution).
 static int pat_arg_simple(TkPattern *p) {
     if (!p) return 1;
-    if (p->kind == TK_PAT_BIND || p->kind == TK_PAT_WILD || p->kind == TK_PAT_LIT) return 1;
+    if (p->kind == TK_PAT_BIND || p->kind == TK_PAT_WILD || p->kind == TK_PAT_LIT || p->kind == TK_PAT_REF) return 1;
     return 0;
 }
 static int pat_binds(TkPattern *p) {
@@ -368,9 +370,24 @@ static void check_stmt(Scope *s, TkStmt *st) {
             check_stmts(inner, st->then_s, st->then_n, st->then_t);
             break;
         }
-        case TK_ST_DEFER: break;
-        case TK_ST_BREAK: case TK_ST_CONTINUE: break;
-        case TK_ST_RETURN: if (st->has_ret) check_expr(s, st->ret_e); break;
+        case TK_ST_DEFER: {
+            in_defer++;
+            if (st->defer_is_block) {
+                Scope *inner = scope_new(s->arena, s);
+                check_stmts(inner, st->defer_blk, st->defer_n, st->defer_t);
+            } else if (st->defer_simple) {
+                check_stmt(s, st->defer_simple);
+            }
+            in_defer--;
+            break;
+        }
+        case TK_ST_BREAK: case TK_ST_CONTINUE:
+            if (in_defer) err("break/continue inside defer is not allowed", NULL);
+            break;
+        case TK_ST_RETURN:
+            if (in_defer) err("return inside defer is not allowed", NULL);
+            if (st->has_ret) check_expr(s, st->ret_e);
+            break;
         case TK_ST_LABEL: check_stmt(s, st->lab_s); break;
         case TK_ST_SPAWN_BLK: check_stmts(s, st->sp_blk, st->sp_n, st->sp_t); break;
         case TK_ST_SPAWN_CALL: check_expr(s, st->sp_call); break;
@@ -432,7 +449,7 @@ static int type_reaches_cycle(TkType *t) {
     }
 }
 
-int sema_check(TkProgram *prog, mem_arena *arena) {    errors = 0;
+int sema_check(TkProgram *prog, mem_arena *arena) {    errors = 0; in_defer = 0;
     sema_prog = prog;
     Scope *glob = scope_new(arena, NULL);
     // pre-populate function/global names so calls resolve

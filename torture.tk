@@ -29,6 +29,45 @@ fn unwrap(Wrap w) -> u64 {
 
 fn cook(u64 x) -> u64 { return x * 2 + 1; }
 
+fn defer_early(i32 c) -> i32 {
+    defer tk_print_i32(99);
+    if (c == 1) { return 7; }
+    tk_print_i32(8);
+    return 9;
+}
+
+fn defer_main() {
+    defer tk_print_i32(3);
+    tk_print_i32(1);
+    defer { tk_print_i32(2); }
+}
+
+fn defer_cap() {
+    i32 x = 41;
+    defer tk_print_i32(x + 1);
+    {
+        i32 y = 10;
+        defer tk_print_i32(y);
+    }
+    tk_print_i32(0);
+}
+
+fn defer_assign() {
+    mut i32 v = 1;
+    defer tk_print_i32(v);
+    defer v = v + 10;
+    tk_print_i32(v);
+}
+
+fn defer_loop() {
+    mut i32 i = 0;
+    while (i < 3) {
+        defer tk_print_i32(7);
+        i = i + 1;
+    }
+    tk_print_i32(50);
+}
+
 fn main() {
     tk_print_i32(sum8(1, 2, 3, 4, 5, 6, 7, 8) as i32);
     Inner p = Inner { a: 100, b: 1, };
@@ -53,5 +92,29 @@ fn main() {
     tk_print_i32(l.data[0] as i32);
     tk_print_i32(l.data[1] as i32);
     tk_print_i32(cook(cook(cook(1))) as i32);
+    tk_print_i32((16 >> 2) as i32);
+    tk_print_i32((1 << 3) as i32);
+    mut i32 sq = 16;
+    sq >>= 2;
+    tk_print_i32(sq);
+    sq <<= 1;
+    tk_print_i32(sq);
+    mut u64 uq = 256;
+    uq >>= 4;
+    tk_print_i32(uq as i32);
+    tk_print_i32(((0 - 8) >> 2));
+    i32 ba = { mut i32 t = 6; t = t * 7; t + 1 };
+    tk_print_i32(ba);
+    tk_print_i32({ 10 } + { 20 });
+    i32 n2 = 5;
+    tk_print_i32({ mut i32 m = n2 * 2; m + n2 });
+    Inner qb = { Inner q = Inner { a: 10, b: 20, }; q };
+    tk_print_i32(qb.a as i32 + qb.b);
+    tk_print_i32(defer_early(1));
+    tk_print_i32(defer_early(0));
+    defer_main();
+    defer_cap();
+    defer_assign();
+    defer_loop();
     return;
 }
