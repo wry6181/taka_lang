@@ -27,12 +27,24 @@ static int match_gt(B*b){
     return 0;
 }
 static int match(B*b,TokenKind k){ if(pk(b)==k){b->pos++;return 1;} return 0; }
+// Allocation policy: infallible-or-fatal. Arena exhaustion prints and exits
+// (same as rustc on OOM) — never a silent NULL, never partial state. Every
+// builder byte lives in b->a and dies with the arena.
+static void *push(B*b,int sz);
+static char *dupstr(B*b,const char*s,int n);
 static Token *expect(B*b,TokenKind k,const char *w){
-    if(!match(b,k)){ static char buf[256]; snprintf(buf,sizeof buf,"expected %s at %d:%d",w,peek(b)->line,peek(b)->col); b->err=buf; return NULL; }
+    if(!match(b,k)){
+        // Owned message: format on the stack, then dup into the arena, so
+        // b->err never aliases shared mutable state (reentrant, stable).
+        char msg[128];
+        snprintf(msg,sizeof msg,"expected %s at %d:%d",w,peek(b)->line,peek(b)->col);
+        b->err=dupstr(b,msg,(int)strlen(msg));
+        return NULL;
+    }
     return &b->t[b->pos-1];
 }
 static char *dupstr(B*b,const char*s,int n){
-    char*o=(char*)arena_push(b->a,(u64)n+1,0); memcpy(o,s,(size_t)n); o[n]=0; return o;
+    char*o=(char*)push(b,n+1); memcpy(o,s,(size_t)n); o[n]=0; return o;
 }
 static char *tokstr(B*b,Token*t){ return dupstr(b,t->start,(int)t->len); }
 static void *push(B*b,int sz){ void*p=arena_push(b->a,(u64)sz,1); if(!p){ fprintf(stderr,"out of memory\n"); exit(1); } return p; }
@@ -67,7 +79,7 @@ static TkType *b_type(B*b){
             TkType*elem=b_type(b); if(!elem||b->err)return NULL;
             if(match(b,TOKEN_COMMA)){ b->err="List takes exactly one type arg"; return NULL; }
             if(!match_gt(b)){ b->err="expected '>' for List<T>"; return NULL; }
-            t->gargs=(TkType**)arena_push(b->a,sizeof(TkType*),1);
+            t->gargs=(TkType**)push(b,sizeof(TkType*));
             t->gargs[0]=elem; t->gcount=1;
         }
     } else { b->err="expected type"; return NULL; }
@@ -141,7 +153,7 @@ static TkExpr *b_primary(B*b){
                 TkExpr*e=new_expr(b,TK_EX_STRUCT_LIT); e->path=pth; b->pos++; // {
                 int sfcap=0; e->sfields=NULL; e->scount=0;
                 // cap 16
-                e->sfields=(typeof(e->sfields))arena_push(b->a,sizeof(*e->sfields)*16,1);
+                e->sfields=(typeof(e->sfields))push(b,sizeof(*e->sfields)*16);
                 if(pk(b)!=TOKEN_RBRACE){
                     for(;;){
                         Token*fn=expect(b,TOKEN_IDENT,"field"); if(!fn)return NULL;
@@ -347,7 +359,7 @@ static TkStmt *b_stmt(B*b){
                 Token*nm=expect(b,TOKEN_IDENT,"name"); if(!nm)return NULL;
                 if(!expect(b,TOKEN_EQ,"'='"))return NULL;
                 TkExpr*in=b_expr(b); if(!in||b->err)return NULL;
-                TkStmt*d=new_stmt(b,TK_ST_DECL); d->is_mut=ismut; d->ty=ty; d->names=(char**)arena_push(b->a,sizeof(char*)*2,1); d->inits=(TkExpr**)arena_push(b->a,sizeof(TkExpr*)*2,1); d->names[0]=tokstr(b,nm); d->inits[0]=in; d->dcount=1;
+                TkStmt*d=new_stmt(b,TK_ST_DECL); d->is_mut=ismut; d->ty=ty; d->names=(char**)push(b,sizeof(char*)*2); d->inits=(TkExpr**)push(b,sizeof(TkExpr*)*2); d->names[0]=tokstr(b,nm); d->inits[0]=in; d->dcount=1;
                 s->for_init_decl=d; s->for_init_is_decl=1;
             } else {
                 TkExpr*e1=b_expr(b); if(!e1||b->err)return NULL; TkStmt*q=new_stmt(b,TK_ST_SIMPLE); q->e1=e1;
@@ -423,7 +435,7 @@ static TkStmt *b_stmt(B*b){
                 Token*nm=expect(b,TOKEN_IDENT,"name"); if(!nm)return NULL;
                 if(!expect(b,TOKEN_EQ,"'='"))return NULL;
                 TkExpr*in=b_expr(b); if(!in||b->err)return NULL;
-                TkStmt*s=new_stmt(b,TK_ST_DECL); s->is_mut=ismut; s->ty=ty; s->names=(char**)arena_push(b->a,sizeof(char*)*2,1); s->inits=(TkExpr**)arena_push(b->a,sizeof(TkExpr*)*2,1); s->names[0]=tokstr(b,nm); s->inits[0]=in; s->dcount=1;
+                TkStmt*s=new_stmt(b,TK_ST_DECL); s->is_mut=ismut; s->ty=ty; s->names=(char**)push(b,sizeof(char*)*2); s->inits=(TkExpr**)push(b,sizeof(TkExpr*)*2); s->names[0]=tokstr(b,nm); s->inits[0]=in; s->dcount=1;
                 if(!expect(b,TOKEN_SEMI,"';'"))return NULL; return s;
             }
         }
@@ -439,7 +451,7 @@ static TkStmt *b_stmt(B*b){
 
 TkProgram *ast_build_core(Token *toks,int count,mem_arena *arena,const char **err_out){
     B b={toks,count,0,arena,NULL};
-    TkProgram*prog=(TkProgram*)arena_push(arena,sizeof *prog,1);
+    TkProgram*prog=(TkProgram*)push(&b,sizeof *prog);
     int itemcap=0; prog->items=NULL; prog->count=0;
 #define EMIT_ITEM(it) do { BAPPEND(&b, prog->items, prog->count, itemcap, it); if(b.err)break; } while(0)
     while(b.t[b.pos].kind!=TOKEN_EOF){
@@ -453,7 +465,7 @@ TkProgram *ast_build_core(Token *toks,int count,mem_arena *arena,const char **er
             if(!expect(&b,TOKEN_FN,"'fn'"))break;
             Token*nm=expect(&b,TOKEN_IDENT,"name"); if(!nm)break;
             if(!expect(&b,TOKEN_LPAREN,"'('"))break;
-            TkItem*it=(TkItem*)arena_push(arena,sizeof *it,1); it->kind=TK_IT_EXTERN; it->fn_name=tokstr(&b,nm);
+            TkItem*it=(TkItem*)push(&b,sizeof *it); it->kind=TK_IT_EXTERN; it->fn_name=tokstr(&b,nm);
             int epcap=0; it->params=NULL; it->pcount=0;
             if(pk(&b)!=TOKEN_RPAREN){
                 for(;;){ int ism=match(&b,TOKEN_MUT); TkType*ty=b_type(&b); if(!ty||b.err)break; Token*pn=expect(&b,TOKEN_IDENT,"param"); if(!pn)break;
@@ -469,7 +481,7 @@ TkProgram *ast_build_core(Token *toks,int count,mem_arena *arena,const char **er
             b.pos++; Token*nm=expect(&b,TOKEN_IDENT,"struct"); if(!nm)break;
             if(pk(&b)==TOKEN_LT){b.err="generics not in core builder";break;}
             if(!expect(&b,TOKEN_LBRACE,"'{'"))break;
-            TkItem*it=(TkItem*)arena_push(arena,sizeof *it,1); it->kind=TK_IT_STRUCT; it->sname=tokstr(&b,nm);
+            TkItem*it=(TkItem*)push(&b,sizeof *it); it->kind=TK_IT_STRUCT; it->sname=tokstr(&b,nm);
             int sfcap=0; it->fields=NULL; it->fcount=0;
             if(pk(&b)!=TOKEN_RBRACE){ for(;;){ TkType*ty=b_type(&b); if(!ty||b.err)break; Token*fn=expect(&b,TOKEN_IDENT,"field"); if(!fn)break;
                 typeof(*it->fields) ff; ff.ty=ty; ff.nm=tokstr(&b,fn); ff.is_pub=0; ff.is_priv=0; ff.is_mut=0;
@@ -481,7 +493,7 @@ TkProgram *ast_build_core(Token *toks,int count,mem_arena *arena,const char **er
         if(k==TOKEN_ENUM){
             b.pos++; Token*nm=expect(&b,TOKEN_IDENT,"enum"); if(!nm)break;
             if(!expect(&b,TOKEN_LBRACE,"'{'"))break;
-            TkItem*it=(TkItem*)arena_push(arena,sizeof *it,1); it->kind=TK_IT_ENUM; it->ename=tokstr(&b,nm);
+            TkItem*it=(TkItem*)push(&b,sizeof *it); it->kind=TK_IT_ENUM; it->ename=tokstr(&b,nm);
             int vcap=0; it->vars=NULL; it->vcount=0;
             if(pk(&b)!=TOKEN_RBRACE){ for(;;){ Token*vn=expect(&b,TOKEN_IDENT,"variant"); if(!vn)break;
                 typeof(*it->vars) vv; memset(&vv, 0, sizeof vv); vv.vn=tokstr(&b,vn);
@@ -515,7 +527,7 @@ TkProgram *ast_build_core(Token *toks,int count,mem_arena *arena,const char **er
             b.pos++; Token*nm=expect(&b,TOKEN_IDENT,"fn"); if(!nm)break;
             if(pk(&b)==TOKEN_LT){b.err="generics not in core builder";break;}
             if(!expect(&b,TOKEN_LPAREN,"'('"))break;
-            TkItem*it=(TkItem*)arena_push(arena,sizeof *it,1); it->kind=TK_IT_FN; it->fn_name=tokstr(&b,nm);
+            TkItem*it=(TkItem*)push(&b,sizeof *it); it->kind=TK_IT_FN; it->fn_name=tokstr(&b,nm);
             int pcap=0; it->params=NULL; it->pcount=0;
             if(pk(&b)!=TOKEN_RPAREN){ for(;;){ int ism=match(&b,TOKEN_MUT); TkType*ty=b_type(&b); if(!ty||b.err)break; Token*pn=expect(&b,TOKEN_IDENT,"param"); if(!pn)break;
                 typeof(*it->params) pp; pp.is_mut=ism; pp.ty=ty; pp.nm=tokstr(&b,pn);
@@ -538,9 +550,9 @@ TkProgram *ast_build_core(Token *toks,int count,mem_arena *arena,const char **er
             if(!expect(&b,TOKEN_EQ,"'='"))break;
             TkExpr*in=b_expr(&b); if(!in||b.err)break;
             if(!expect(&b,TOKEN_SEMI,"';'"))break;
-            TkItem*it=(TkItem*)arena_push(arena,sizeof *it,1); it->kind=TK_IT_GLOBAL;
-            TkStmt*d=(TkStmt*)arena_push(arena,sizeof *d,1); d->kind=TK_ST_DECL; d->is_mut=ism; d->ty=ty;
-            d->names=(char**)arena_push(arena,sizeof(char*)*2,1); d->inits=(TkExpr**)arena_push(arena,sizeof(TkExpr*)*2,1);
+            TkItem*it=(TkItem*)push(&b,sizeof *it); it->kind=TK_IT_GLOBAL;
+            TkStmt*d=(TkStmt*)push(&b,sizeof *d); d->kind=TK_ST_DECL; d->is_mut=ism; d->ty=ty;
+            d->names=(char**)push(&b,sizeof(char*)*2); d->inits=(TkExpr**)push(&b,sizeof(TkExpr*)*2);
             d->names[0]=tokstr(&b,nm); d->inits[0]=in; d->dcount=1; it->gdecl=d;
             EMIT_ITEM(it); continue;
         }

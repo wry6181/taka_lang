@@ -5,11 +5,15 @@
 // returns use sret (hidden first arg); extern calls use the C ABI exactly
 // (sview returns arrive in RAX:RDX). Locals/temps are 8-byte frame slots.
 #include "x64.h"
+#include "arena.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
 static FILE *o;
+// Per-emit scratch arena for inferred types ("bump and drop"). Created in
+// x64_emit, destroyed at every exit. See x_push.
+static mem_arena *x_scratch = NULL;
 static int lbl = 0;
 static int failed = 0;
 static void Xerr(const char *msg) { fprintf(stderr, "x64 error: %s\n", msg); failed = 1; }
@@ -391,24 +395,32 @@ static int lit_char_val(Token t, int *out) {
 }
 
 // ---------- type inference for codegen (mirrors cgen rules) ----------
+// Inferred types come from the per-emit scratch arena (see x_scratch):
+// O(1) bump, no per-node frees, dropped at emit end. Valid until x64_emit
+// returns; callers never free. NULL (exhaustion) uses existing paths + Xerr.
+static void *x_push(u64 sz) {
+    void *p = x_scratch ? arena_push(x_scratch, sz, 1) : NULL;
+    if (!p) Xerr("OOM in scratch arena");
+    return p;
+}
 static TkType *xnew_prim(TokenKind p) {
-    TkType *t = calloc(1, sizeof *t);
+    TkType *t = x_push(sizeof *t);
     if (t) { t->kind = TK_TY_PRIM; t->prim = p; }
     return t;
 }
 static TkType *xnew_path1(const char *seg) {
-    TkType *t = calloc(1, sizeof *t);
+    TkType *t = x_push(sizeof *t);
     if (!t) return NULL;
     t->kind = TK_TY_PATH; t->path.count = 1;
-    t->path.segs = calloc(1, sizeof(TkPathSeg));
-    if (!t->path.segs) { free(t); return NULL; }
+    t->path.segs = x_push(sizeof(TkPathSeg));
+    if (!t->path.segs) return NULL;
     t->path.segs[0].seg = (char *)seg;
     return t;
 }
 // copy a type with adjusted pointer depth (for &pat bindings)
 static TkType *copy_ty_star(TkType *t, int dstar) {
     if (!t) return NULL;
-    TkType *n = calloc(1, sizeof *n);
+    TkType *n = x_push(sizeof *n);
     if (!n) return NULL;
     *n = *t; n->stars += dstar;
     return n;
@@ -466,7 +478,7 @@ static TkType *xinfer(TkExpr *e) {
             // List data/len/cap access
             if (bt->kind == TK_TY_PATH && bt->path.count == 1 && !strcmp(bt->path.segs[0].seg, "List") && bt->gcount == 1) {
                 if (!strcmp(e->field, "data")) {
-                    TkType *t = calloc(1, sizeof *t);
+                    TkType *t = x_push(sizeof *t);
                     if (!t) return NULL;
                     *t = *bt->gargs[0];
                     t->stars++;
@@ -490,7 +502,7 @@ static TkType *xinfer(TkExpr *e) {
                 return bt->gargs[0];
             if (bt->kind == TK_TY_ARRAY) return bt->elem;
             if (bt->stars > 0) {
-                TkType *t = calloc(1, sizeof *t);
+                TkType *t = x_push(sizeof *t);
                 if (!t) return NULL;
                 *t = *bt;
                 t->stars--;
@@ -502,7 +514,7 @@ static TkType *xinfer(TkExpr *e) {
             if (e->op == TOKEN_AMP) {
                 TkType *t = xinfer(e->lhs);
                 if (!t) return NULL;
-                TkType *n = calloc(1, sizeof *n);
+                TkType *n = x_push(sizeof *n);
                 if (!n) return NULL;
                 *n = *t;
                 n->stars++;
@@ -511,7 +523,7 @@ static TkType *xinfer(TkExpr *e) {
             if (e->op == TOKEN_STAR) {
                 TkType *t = xinfer(e->lhs);
                 if (t && t->stars > 0) {
-                    TkType *n = calloc(1, sizeof *n);
+                    TkType *n = x_push(sizeof *n);
                     if (!n) return NULL;
                     *n = *t;
                     n->stars--;
@@ -626,6 +638,13 @@ static void store_mem(const char *mem, QW w) {
 }
 static void mem_slot(int slot, char *buf, size_t n) {
     snprintf(buf, n, "%d(%%rbp)", SLOT(slot));
+}
+// rip-relative operand for a global name; Xerr on truncation (a truncated
+// symbol would silently misassemble — never allow it; buf is still NUL-led
+// so later emission fails loudly at assemble time, not silently).
+static void mem_global(const char *name, char *buf, size_t n) {
+    int w = snprintf(buf, n, "%s(%%rip)", name);
+    if (w < 0 || (size_t)w >= n) { Xerr("global name too long"); if (n) buf[0] = 0; }
 }
 // struct memcpy: rsi=src rdi=dst rcx=bytes (caller-saved clobber is fine: only rax live)
 static void emit_memcpy(int bytes) {
@@ -762,7 +781,7 @@ static void emit_var_addr(XV *v) {
 static void emit_var_load(XV *v, QW w) {
     if (v->slot < 0) {
         char m[128];
-        snprintf(m, sizeof m, "%s(%%rip)", v->name);
+        mem_global(v->name, m, sizeof m);
         load_mem(m, w);
         return;
     }
@@ -2338,7 +2357,11 @@ static void build_tables(TkProgram *prog) {
                     e->payload = 1;
                     if (it->vars[j].has_tuple) {
                         e->vars[j].kind = 1; e->vars[j].tn = it->vars[j].tn;
-                        e->vars[j].st = it->vars[j].ts;
+                        // Owned copy: x_free_tables frees every st array, so
+                        // nothing in XE may borrow AST memory (invalid-free).
+                        e->vars[j].st = malloc((size_t)(it->vars[j].tn ? it->vars[j].tn : 1) * sizeof(TkType *));
+                        if (!e->vars[j].st) { Xerr("OOM"); break; }
+                        for (int k = 0; k < it->vars[j].tn; k++) e->vars[j].st[k] = it->vars[j].ts[k];
                         for (int k = 0; k < it->vars[j].tn; k++) xcollect_ty(it->vars[j].ts[k]);
                     } else {
                         e->vars[j].kind = 2; e->vars[j].sfn = it->vars[j].fn2;
@@ -2888,7 +2911,7 @@ static void emit_stmt(TkStmt *s) {
                         TkType *it = xinfer(s->inits[i]);
                         to_width(it ? ty_width(it) : Q_I64, dw);
                         char vm[64];
-                        if (v->slot < 0) snprintf(vm, sizeof vm, "%s(%%rip)", v->name);
+                        if (v->slot < 0) mem_global(v->name, vm, sizeof vm);
                         else mem_slot(v->slot, vm, sizeof vm);
                         store_mem(vm, dw);
                     }
@@ -3382,9 +3405,11 @@ static void emit_fn(TkItem *it) {
     fprintf(o, "    leave\n    ret\n");
 }
 
-int x64_emit(TkProgram *prog, const char *out_path) {
-    // reset all per-program state
-    failed = 0;
+// Per-emit side tables (struct/enum/fn index, List set, rodata, walk env):
+// explicitly owned here. Dropped at emit entry (stale state never survives)
+// and emit end (no leaks). Var/temp buffers (xvs/xts) are per-function
+// bump state handled alongside frame_slots; freed here too.
+static void x_free_tables(void) {
     for (int i = 0; i < xss_n; i++) { free(xss[i].fn); free(xss[i].ft); free(xss[i].off); }
     free(xss); xss = NULL; xss_n = 0;
     for (int i = 0; i < xes_n; i++) {
@@ -3397,14 +3422,24 @@ int x64_emit(TkProgram *prog, const char *out_path) {
     free(xlist_elems); xlist_elems = NULL; xlist_n = xlist_cap = 0;
     for (int i = 0; i < rod_n; i++) free(rod_str[i]);
     free(rod_str); rod_str = NULL; rod_n = rod_cap = 0;
+    free(wts); wts = NULL; wt_n = wt_cap = 0; wt_depth = 0;
+}
+
+int x64_emit(TkProgram *prog, const char *out_path) {
+    // reset all per-program state
+    failed = 0;
+    x_free_tables();
     free(xvs); xvs = NULL; xv_n = xv_cap = xv_global_n = 0; xv_depth = 0;
     free(xts); xts = NULL; xt_n = xt_cap = 0;
     frame_slots = 0;
     lbl = 0;
     loop_n = 0;
+    arena_destroy(x_scratch);
+    x_scratch = arena_create(MByte(16));
+    if (!x_scratch) return 1;
     build_tables(prog);
     o = fopen(out_path, "w");
-    if (!o) return 1;
+    if (!o) { x_free_tables(); arena_destroy(x_scratch); x_scratch = NULL; return 1; }
     fprintf(o, "    # generated taka -> x86-64 (native, no C)\n");
     fprintf(o, "    .text\n");
     // globals registered first (rip-relative; no frame slots)
@@ -3556,5 +3591,11 @@ int x64_emit(TkProgram *prog, const char *out_path) {
     }
     fprintf(o, "    .section .note.GNU-stack,\"\",@progbits\n");
     fclose(o);
-    return failed ? 1 : 0;
+    int rc = failed ? 1 : 0;
+    // drop all per-emit state: tables freed, scratch dropped in one free
+    x_free_tables();
+    free(xvs); xvs = NULL; xv_n = xv_cap = xv_global_n = 0; xv_depth = 0;
+    free(xts); xts = NULL; xt_n = xt_cap = 0;
+    arena_destroy(x_scratch); x_scratch = NULL;
+    return rc;
 }

@@ -1,4 +1,5 @@
 #include "cgen.h"
+#include "arena.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -11,6 +12,7 @@ typedef struct { char *ename; int payload; CgVar *vars; int vcount; } CgEnum;
 static CgEnum *cg_find_enum(const char *name);
 static int cg_find_variant(CgEnum *en, const char *vn);
 static void cg_err(const char *msg);
+static void cg_free_enums(void);
 typedef struct { char *name; TkType *ret; } CgFn;
 typedef struct { char *name; char **fnames; TkType **ftypes; int fn; } CgStruct;
 static CgStruct *cg_find_struct(const char *name);
@@ -270,6 +272,17 @@ static CgStruct *cg_find_struct(const char *name) {
 // collected List<T> instantiations (dedup by structural equality)
 static TkType **cg_list_elems = NULL; static int cg_list_n = 0, cg_list_cap = 0;
 static CgVarEntry *cg_vars = NULL; static int cg_var_n = 0, cg_var_cap = 0, cg_var_fn_base = 0;
+// Per-emit side tables (fn/struct/List index): explicitly owned here, dropped
+// at emit entry (stale state never survives) and emit end (no leaks).
+static void cg_free_tables(void) {
+    for (int i = 0; i < cg_struct_n; i++) {
+        free(cg_structs[i].fnames);
+        free(cg_structs[i].ftypes);
+    }
+    free(cg_list_elems); cg_list_elems = NULL; cg_list_n = 0; cg_list_cap = 0;
+    free(cg_fns); cg_fns = NULL; cg_fn_n = 0;
+    free(cg_structs); cg_structs = NULL; cg_struct_n = 0;
+}
 static CgEnum *cg_find_enum(const char *name) {
     for (int i = 0; i < cg_enum_n; i++) if (strcmp(cg_enums[i].ename, name) == 0) return &cg_enums[i];
     return NULL;
@@ -279,6 +292,7 @@ static int cg_find_variant(CgEnum *en, const char *vn) {
     return -1;
 }
 static void cg_build_enums(TkProgram *prog) {
+    cg_free_enums(); // drop any previous emit's table: no leaks, no stale state
     int n = 0; for (int i = 0; i < prog->count; i++) if (prog->items[i]->kind == TK_IT_ENUM) n++;
     cg_enums = n ? (CgEnum*)calloc((size_t)n, sizeof(CgEnum)) : NULL; cg_enum_n = n;
     int k = 0;
@@ -424,23 +438,33 @@ static TkType *cg_var_find(const char *name) {
     return NULL;
 }
 static void cg_vars_fn_reset(void) { cg_var_n = cg_var_fn_base; cg_depth = 0; }
+// Per-emit scratch arena ("bump and drop") for inferred types: O(1) bump
+// alloc, zero per-node frees, whole arena dropped at emit end. Returned
+// types are valid until cgen_emit returns; callers never free them. NULL
+// (exhaustion) propagates through the existing unknown-type paths + cg_err.
+static mem_arena *cg_scratch = NULL;
+static void *cg_push(u64 sz) {
+    void *p = cg_scratch ? arena_push(cg_scratch, sz, 1) : NULL;
+    if (!p) cg_err("OOM in scratch arena");
+    return p;
+}
 static TkType *new_ty_prim(TokenKind p) {
-    TkType *t = (TkType*)calloc(1, sizeof *t);
+    TkType *t = (TkType*)cg_push(sizeof *t);
     if (t) { t->kind = TK_TY_PRIM; t->prim = p; }
     return t;
 }
 static TkType *new_ty_path1(const char *seg) {
-    TkType *t = (TkType*)calloc(1, sizeof *t);
+    TkType *t = (TkType*)cg_push(sizeof *t);
     if (!t) return NULL;
     t->kind = TK_TY_PATH; t->path.count = 1;
-    t->path.segs = (TkPathSeg*)calloc(1, sizeof(TkPathSeg));
-    if (!t->path.segs) { free(t); return NULL; }
+    t->path.segs = (TkPathSeg*)cg_push(sizeof(TkPathSeg));
+    if (!t->path.segs) return NULL;
     t->path.segs[0].seg = (char*)seg;
     return t;
 }
 static TkType *copy_ty_star(TkType *t, int dstar) {
     if (!t) return NULL;
-    TkType *n = (TkType*)calloc(1, sizeof *n);
+    TkType *n = (TkType*)cg_push(sizeof *n);
     if (!n) return NULL;
     *n = *t; n->stars += dstar;
     return n;
@@ -851,11 +875,13 @@ static int item_needs_list_first(TkItem *it) {
 int cgen_emit(TkProgram *prog, const char *out_path) {
     cg_failed = 0;
     cg_used_defer = 0;
+    tmp_n = 0; // per-emit ids: same input -> same output, no history dependence
+    arena_destroy(cg_scratch);
+    cg_scratch = arena_create(MByte(16));
+    if (!cg_scratch) return 1;
     cg_build_enums(prog);
-    free(cg_list_elems); cg_list_elems = NULL; cg_list_n = 0; cg_list_cap = 0;
+    cg_free_tables();
     cg_var_n = 0; cg_var_fn_base = 0; cg_depth = 0;
-    free(cg_fns); cg_fns = NULL; cg_fn_n = 0;
-    free(cg_structs); cg_structs = NULL; cg_struct_n = 0;
     // fn + struct tables for auto inference / field types
     for (int i = 0; i < prog->count; i++) {
         TkItem *it = prog->items[i];
@@ -893,7 +919,7 @@ int cgen_emit(TkProgram *prog, const char *out_path) {
         cg_list_elems[j] = t;
     }
     out = fopen(out_path,"w");
-    if(!out) { cg_free_enums(); return 1; }
+    if(!out) { cg_free_enums(); arena_destroy(cg_scratch); cg_scratch = NULL; return 1; }
     fprintf(out,"// generated taka -> C (core runnable + stubs for dyn/effects). C stdlib only.\n");
     fprintf(out,"#include <stdint.h>\n#include <stdio.h>\n#include <stdbool.h>\n#include <stddef.h>\n#include <stdlib.h>\n");
     fprintf(out,"#include \"taka_runtime.h\"\n\n");
@@ -1026,9 +1052,9 @@ int cgen_emit(TkProgram *prog, const char *out_path) {
     fclose(out);
     int rc = cg_failed ? 1 : 0;
     cg_free_enums();
-    free(cg_list_elems); cg_list_elems = NULL; cg_list_n = cg_list_cap = 0;
+    cg_free_tables();
     free(cg_vars); cg_vars = NULL; cg_var_n = cg_var_cap = cg_var_fn_base = 0; cg_depth = 0;
-    free(cg_fns); cg_fns = NULL; cg_fn_n = 0;
-    free(cg_structs); cg_structs = NULL; cg_struct_n = 0;
+    // drop the whole scratch working set in one free (no per-node bookkeeping)
+    arena_destroy(cg_scratch); cg_scratch = NULL;
     return rc;
 }
