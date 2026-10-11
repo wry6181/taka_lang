@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Regenerates the GENERATED block at the end of self_lex.tk from
 # lexer.h (kind ordinals) + lexer.c (keyword table).
-# Usage (from repo root): python3 gen_tklex.py
+# Usage (from repo root): python3 tools/gen_tklex.py
 import re
 
-h = open('lexer.h').read()
-c = open('lexer.c').read()
+h = open('src/lexer.h').read()
+c = open('src/lexer.c').read()
 enum_body = h.split('typedef enum {')[1].split('} TokenKind')[0]
 names = []
 for line in enum_body.split('\n'):
@@ -28,8 +28,8 @@ for text, kind in kws:
 out.append("    return K_IDENT;")
 out.append("}")
 
-src = open('self_lex.tk').read().split('\n')
+src = open('selfhost/self_lex.tk').read().split('\n')
 cut = next(i for i, l in enumerate(src) if l.startswith('// GENERATED'))
 src = src[:cut]
-open('self_lex.tk', 'w').write('\n'.join(src) + '\n' + '\n'.join(out) + '\n')
+open('selfhost/self_lex.tk', 'w').write('\n'.join(src) + '\n' + '\n'.join(out) + '\n')
 print(f"self_lex.tk regenerated: {len(names)} kinds, {len(kws)} keywords")

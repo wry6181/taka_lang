@@ -88,7 +88,7 @@ fn main() {
 -1
 ```
 
-The repository's `map_test.tk` scales this exact pattern into a
+The repository's `tests/map_test.tk` scales this exact pattern into a
 Robin-Hood hash map (`StrMap` over `List<StrEntry>`) — read it when
 you outgrow linear scan. And when you need a map with non-string keys
 or a set, a tree, a graph: this chapter is the whole toolkit. There is

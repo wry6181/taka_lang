@@ -26,7 +26,7 @@ fn main() {
 
 The full set — `tk_fopen/fclose/fseek/ftell/fread/fwrite` — mirrors
 stdio one-to-one (signatures in Chapter 12). Errors are values: a null
-handle, a short count. The repository's `file_test.tk` shows the read
+handle, a short count. The repository's `tests/file_test.tk` shows the read
 path (`fseek` to end, `ftell` for size, one `fread`).
 
 ## Command-line arguments
@@ -44,10 +44,10 @@ fn main() {
 
 `tk_argc()` is the count, `tk_argv(i)` the i-th argument or NULL out
 of range (the driver fills these from the real `argc`/`argv`). The
-repository's `args_test.tk` is the canonical example:
+repository's `tests/args_test.tk` is the canonical example:
 
 ```text
-$ ./taka run args_test.tk hello
+$ ./taka run tests/args_test.tk hello
 2
 1
 1

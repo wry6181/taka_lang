@@ -98,7 +98,7 @@ fn main() {
     tk_print_i32(str_eq(a, tk_sview("42", 2)) as i32);
     tk_print_i32(str_eq(b, tk_sview("-7", 2)) as i32);
     tk_print_i32(str_eq(a, b) as i32);
-    u8* f = tk_fopen("str_out.txt", "w");
+    u8* f = tk_fopen("tests/str_out.txt", "w");
     List<u8> out = [104, 105, 32];
     sview num = i32_to_str(42, &ar);
     mut u64 j = 0;
@@ -109,7 +109,7 @@ fn main() {
     out.push(10);
     tk_fwrite(out.data, 1, out.len, f);
     tk_fclose(f);
-    FileData back = read_all("str_out.txt", &ar);
+    FileData back = read_all("tests/str_out.txt", &ar);
     tk_print_i32(back.len as i32);
     sview want = tk_sview("hi 42\n", 6);
     sview got = tk_sview_u8(back.data, back.len);

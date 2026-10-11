@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # Generates taka kind constants for ast.h enums + token kind-name table.
-# Usage: python3 gen_tkast.py   (writes /tmp/tkast_gen.tk)
+# Usage (from repo root): python3 tools/gen_tkast.py   (writes /tmp/tkast_gen.tk)
 import re
 
-h = open('ast.h').read()
-lx = open('lexer.c').read()
+h = open('src/ast.h').read()
+lx = open('src/lexer.c').read()
 
 
 def enum_names(body):

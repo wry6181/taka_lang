@@ -15,7 +15,7 @@ home.
 
 ## Design rules
 
-The grammar file (`grammar.ebnf`) states what taka deliberately does
+The grammar file (`docs/grammar.ebnf`) states what taka deliberately does
 *not* have, and these rules shape everything in this book:
 
 - **No overloading, no implicit conversions** (use `as`), no operator

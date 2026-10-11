@@ -1837,15 +1837,24 @@ static void stem_of(const char *path, char *out, size_t n) {
     if (!out[0]) snprintf(out, n, "a");
 }
 
-// Directory holding taka_runtime.h: cwd if present, else the compiler's dir.
+// Directory holding runtime/taka_runtime.h: cwd if present, else the
+// compiler's dir, else <exe-dir>/runtime (repo layout: taka + runtime/).
 static void include_dir(char *out, size_t n) {
     if (access("taka_runtime.h", R_OK) == 0) { snprintf(out, n, "."); return; }
+    if (access("runtime/taka_runtime.h", R_OK) == 0) { snprintf(out, n, "runtime"); return; }
     char exe[1024];
     ssize_t m = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (m > 0) {
         exe[m] = 0;
         char *sl = strrchr(exe, '/');
-        if (sl) { *sl = 0; snprintf(out, n, "%s", exe); return; }
+        if (sl) {
+            *sl = 0;
+            snprintf(out, n, "%s", exe);
+            char rt[1152];
+            snprintf(rt, sizeof rt, "%s/runtime/taka_runtime.h", exe);
+            if (access(rt, R_OK) == 0) { snprintf(out, n, "%s/runtime", exe); return; }
+            return;
+        }
     }
     snprintf(out, n, ".");
 }

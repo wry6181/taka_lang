@@ -71,8 +71,8 @@ test result: 2 passed; 0 failed
 ```
 
 ```text
-$ ./taka check hello.tk
-parse OK
+$ ./taka check hello.tk; echo "exit=$?"
+exit=0
 ```
 
 - `--backend=c|native` selects the C backend (default) or the direct
@@ -83,9 +83,9 @@ parse OK
 - `taka check` on a bad program fails loudly with exit code 1:
 
 ```text
-$ ./taka check bad_mut.tk
-parse OK
+$ ./taka check tests/bad_mut.tk; echo "exit=$?"
 sema error: mutation of non-mut binding 'a'
+exit=1
 ```
 
 (Chapter 8 tours every safety rule and its message.)

@@ -58,7 +58,7 @@ fn main() {
         return;
     }
     Arena ar = arena_mk(buf, 4096);
-    FileData fd = read_file("file_fixture.txt", &ar);
+    FileData fd = read_file("tests/file_fixture.txt", &ar);
     tk_print_i32(fd.len as i32);
     if (fd.len > 0) {
         tk_print_i32(fd.data[0] as i32);
